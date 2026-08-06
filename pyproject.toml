@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "orca-train"
+version = "0.1.0"
+description = "Visual reinforcement learning pipelines for the ORCA Hand"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "gymnasium>=0.29",
+    "mujoco>=3.1",
+    "numpy>=1.26",
+    "torch>=2.3",
+    "orca_sim",
+]
+
+[tool.uv.sources]
+orca_sim = { path = "../orca_sim", editable = true }
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+orca-train-drqv2 = "orca_train.train:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/orca_train"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
