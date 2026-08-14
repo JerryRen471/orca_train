@@ -25,6 +25,26 @@ def schedule(spec: str | float, step: int) -> float:
     return float((1.0 - mix) * start + mix * end)
 
 
+def sample_noisy_action(
+    mean: torch.Tensor,
+    stddev: float,
+    clip: float,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    noise = torch.randn(
+        mean.shape,
+        dtype=mean.dtype,
+        device=mean.device,
+        generator=generator,
+    )
+    noise = (noise * stddev).clamp(-clip, clip)
+    return (mean + noise).clamp(-1.0, 1.0)
+
+
+def actor_loss_from_q_values(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    return -torch.minimum(q1, q2).mean()
+
+
 class RandomShiftsAug(nn.Module):
     def __init__(self, pad: int = 4):
         super().__init__()
@@ -149,10 +169,9 @@ class DrQV2Agent:
             next_observation = self._features(next_pixels, batch.next_proprio)
             next_action = self.actor(next_observation)
             stddev = schedule(self.config.stddev_schedule, step)
-            noise = (torch.randn_like(next_action) * stddev).clamp(
-                -self.config.stddev_clip, self.config.stddev_clip
+            next_action = sample_noisy_action(
+                next_action, stddev, self.config.stddev_clip
             )
-            next_action = (next_action + noise).clamp(-1.0, 1.0)
             target_q1, target_q2 = self.critic_target(next_observation, next_action)
             target_q = batch.rewards + batch.discounts * torch.minimum(target_q1, target_q2)
 
@@ -165,9 +184,11 @@ class DrQV2Agent:
         self.critic_optimizer.step()
 
         detached_observation = observation.detach()
-        action = self.actor(detached_observation)
-        actor_q, _ = self.critic(detached_observation, action)
-        actor_loss = -actor_q.mean()
+        action = sample_noisy_action(
+            self.actor(detached_observation), stddev, self.config.stddev_clip
+        )
+        actor_q1, actor_q2 = self.critic(detached_observation, action)
+        actor_loss = actor_loss_from_q_values(actor_q1, actor_q2)
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
         self.actor_optimizer.step()
@@ -180,6 +201,7 @@ class DrQV2Agent:
             "critic_loss": float(critic_loss.item()),
             "actor_loss": float(actor_loss.item()),
             "q": float(q1.mean().item()),
+            "target_q": float(target_q.mean().item()),
         }
 
     def save(self, path: str | Path, step: int) -> None:

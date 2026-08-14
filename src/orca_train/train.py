@@ -12,7 +12,7 @@ import torch
 
 from .agent import DrQV2Agent, DrQV2Config
 from .env import OrcaVisualCubeEnv
-from .replay import ReplayBuffer
+from .replay import NStepAccumulator, ReplayBuffer
 
 
 @dataclass(frozen=True)
@@ -20,9 +20,11 @@ class TrainConfig:
     total_steps: int = 1_000_000
     seed_steps: int = 5_000
     eval_every_steps: int = 10_000
-    eval_episodes: int = 5
+    eval_episodes: int = 20
+    eval_seed: int = 10_000
     checkpoint_every_steps: int = 50_000
-    replay_capacity: int = 20_000
+    replay_capacity: int = 200_000
+    nstep: int = 3
     batch_size: int = 256
     gamma: float = 0.99
     seed: int = 1
@@ -32,6 +34,12 @@ class TrainConfig:
     max_delta_degrees: float = 3.0
     feature_dim: int = 50
     hidden_dim: int = 1024
+    fix_wrist: bool = False
+    drop_penalty: float = 10.0
+    reward_mode: str = "progress"
+    progress_reward_scale: float = 5.0
+    success_bonus: float = 10.0
+    step_penalty: float = 0.01
 
 
 def select_device(requested: str) -> str:
@@ -53,22 +61,27 @@ def write_metric(path: Path, event: dict) -> None:
 def evaluate(agent: DrQV2Agent, env, episodes: int, seed: int) -> dict[str, float]:
     returns = []
     successes = []
+    drops = []
     for episode in range(episodes):
         observation, _ = env.reset(seed=seed + episode)
         done = False
         episode_return = 0.0
         success = False
+        dropped = False
         while not done:
             action = agent.act(observation, step=0, eval_mode=True)
             observation, reward, terminated, truncated, info = env.step(action)
             episode_return += reward
             success = success or bool(info.get("is_success", info.get("success", False)))
+            dropped = dropped or bool(info.get("dropped", False))
             done = terminated or truncated
         returns.append(episode_return)
         successes.append(success)
+        drops.append(dropped)
     return {
         "return": float(np.mean(returns)),
         "success_rate": float(np.mean(successes)),
+        "drop_rate": float(np.mean(drops)),
     }
 
 
@@ -87,7 +100,16 @@ def train(
     )
 
     if env_factory is None:
-        env_factory = lambda: OrcaVisualCubeEnv(max_delta_degrees=config.max_delta_degrees)
+        fixed_joint_names = ("right_wrist",) if config.fix_wrist else ()
+        env_factory = lambda: OrcaVisualCubeEnv(
+            max_delta_degrees=config.max_delta_degrees,
+            fixed_joint_names=fixed_joint_names,
+            drop_penalty=config.drop_penalty,
+            reward_mode=config.reward_mode,
+            progress_reward_scale=config.progress_reward_scale,
+            success_bonus=config.success_bonus,
+            step_penalty=config.step_penalty,
+        )
     env = env_factory()
     eval_env = env_factory()
     observation, _ = env.reset(seed=config.seed)
@@ -97,8 +119,16 @@ def train(
         hidden_dim=config.hidden_dim,
         batch_size=config.batch_size,
     )
-    agent = DrQV2Agent(observation["pixels"].shape, observation["proprio"].size, 17, device, agent_config)
+    action_dim = env.action_space.shape[0]
+    agent = DrQV2Agent(
+        observation["pixels"].shape,
+        observation["proprio"].size,
+        action_dim,
+        device,
+        agent_config,
+    )
     replay = ReplayBuffer(config.replay_capacity, config.seed)
+    nstep_accumulator = NStepAccumulator(config.nstep, config.gamma)
     start_step = agent.load(config.resume) if config.resume else 0
     episode_return = 0.0
     episode_length = 0
@@ -106,13 +136,26 @@ def train(
     try:
         for step in range(start_step + 1, config.total_steps + 1):
             if step <= config.seed_steps:
-                action = rng.uniform(-1.0, 1.0, size=17).astype(np.float32)
+                action = rng.uniform(-1.0, 1.0, size=action_dim).astype(np.float32)
             else:
                 action = agent.act(observation, step)
             next_observation, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
-            discount = 0.0 if terminated else config.gamma
-            replay.add(observation, action, reward, discount, next_observation)
+            for transition in nstep_accumulator.add(
+                observation,
+                action,
+                reward,
+                next_observation,
+                terminated,
+                episode_end=done,
+            ):
+                replay.add(
+                    transition.observation,
+                    transition.action,
+                    transition.reward,
+                    transition.discount,
+                    transition.next_observation,
+                )
             observation = next_observation
             episode_return += reward
             episode_length += 1
@@ -129,13 +172,14 @@ def train(
                     "return": episode_return,
                     "length": episode_length,
                     "success": bool(info.get("is_success", info.get("success", False))),
+                    "dropped": bool(info.get("dropped", False)),
                 })
                 observation, _ = env.reset()
                 episode_return = 0.0
                 episode_length = 0
 
             if config.eval_every_steps and step % config.eval_every_steps == 0:
-                result = evaluate(agent, eval_env, config.eval_episodes, config.seed + step)
+                result = evaluate(agent, eval_env, config.eval_episodes, config.eval_seed)
                 event = {"type": "evaluation", "step": step, **result}
                 write_metric(metrics_path, event)
                 print(json.dumps(event, ensure_ascii=False), flush=True)
@@ -156,15 +200,23 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--total-steps", type=int, default=1_000_000)
     parser.add_argument("--seed-steps", type=int, default=5_000)
     parser.add_argument("--eval-every-steps", type=int, default=10_000)
-    parser.add_argument("--eval-episodes", type=int, default=5)
+    parser.add_argument("--eval-episodes", type=int, default=20)
+    parser.add_argument("--eval-seed", type=int, default=10_000)
     parser.add_argument("--checkpoint-every-steps", type=int, default=50_000)
-    parser.add_argument("--replay-capacity", type=int, default=20_000)
+    parser.add_argument("--replay-capacity", type=int, default=200_000)
+    parser.add_argument("--nstep", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "mps", "cuda"))
     parser.add_argument("--output-dir", type=Path, default=Path("runs/drqv2_cube_flip"))
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--max-delta-degrees", type=float, default=3.0)
+    parser.add_argument("--fix-wrist", action="store_true")
+    parser.add_argument("--drop-penalty", type=float, default=10.0)
+    parser.add_argument("--reward-mode", choices=("absolute", "progress"), default="progress")
+    parser.add_argument("--progress-reward-scale", type=float, default=5.0)
+    parser.add_argument("--success-bonus", type=float, default=10.0)
+    parser.add_argument("--step-penalty", type=float, default=0.01)
     args = parser.parse_args()
     return TrainConfig(**vars(args))
 

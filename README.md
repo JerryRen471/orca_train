@@ -27,6 +27,7 @@ trainer from a normal logged-in Terminal rather than an SSH-only session.
 cd /Users/jerry/Code/orca_train
 uv run orca-train-drqv2 \
   --device mps \
+  --fix-wrist \
   --total-steps 1000000 \
   --output-dir runs/cube_flip_seed1
 ```

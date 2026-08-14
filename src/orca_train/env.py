@@ -25,6 +25,12 @@ class OrcaVisualCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         camera_name: str = "closeup",
         randomize_reset: bool = True,
         cube_pos_xy_jitter: float = 0.01,
+        fixed_joint_names: tuple[str, ...] = (),
+        drop_penalty: float = 1.0,
+        reward_mode: str = "absolute",
+        progress_reward_scale: float = 5.0,
+        success_bonus: float = 10.0,
+        step_penalty: float = 0.01,
     ) -> None:
         super().__init__()
         if image_size <= 0:
@@ -42,6 +48,11 @@ class OrcaVisualCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
                 render_mode=None,
                 initial_red_face="down",
                 cube_pos_xy_jitter=cube_pos_xy_jitter,
+                drop_penalty=drop_penalty,
+                reward_mode=reward_mode,
+                progress_reward_scale=progress_reward_scale,
+                success_bonus=success_bonus,
+                step_penalty=step_penalty,
             )
 
         self.env = env
@@ -51,6 +62,7 @@ class OrcaVisualCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         self.camera_name = camera_name
         self.randomize_reset = bool(randomize_reset)
         self.cube_pos_xy_jitter = float(cube_pos_xy_jitter)
+        self.fixed_joint_names = frozenset(fixed_joint_names)
 
         self._actuator_qpos_indices = self._resolve_actuator_qpos_indices()
         action_shape = tuple(self.env.action_space.shape)
@@ -59,7 +71,23 @@ class OrcaVisualCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
 
         self._joint_low = np.asarray(self.env.action_space.low, dtype=np.float32)
         self._joint_high = np.asarray(self.env.action_space.high, dtype=np.float32)
-        self.action_space = spaces.Box(-1.0, 1.0, shape=(17,), dtype=np.float32)
+        joint_names = [
+            self.env.model.joint(int(self.env.model.actuator_trnid[index, 0])).name
+            for index in range(17)
+        ]
+        missing = self.fixed_joint_names.difference(joint_names)
+        if missing:
+            raise ValueError(f"Fixed joints are not actuated by this model: {sorted(missing)}")
+        self._active_actuator_indices = np.asarray(
+            [index for index, name in enumerate(joint_names) if name not in self.fixed_joint_names],
+            dtype=np.int32,
+        )
+        self.action_space = spaces.Box(
+            -1.0,
+            1.0,
+            shape=(len(self._active_actuator_indices),),
+            dtype=np.float32,
+        )
         self.observation_space = spaces.Dict(
             {
                 "pixels": spaces.Box(
@@ -68,12 +96,7 @@ class OrcaVisualCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
                     shape=(3 * self.frame_stack, self.image_size, self.image_size),
                     dtype=np.uint8,
                 ),
-                "proprio": spaces.Box(
-                    self._joint_low,
-                    self._joint_high,
-                    shape=(17,),
-                    dtype=np.float32,
-                ),
+                "proprio": spaces.Box(-1.0, 1.0, shape=(17,), dtype=np.float32),
             }
         )
 
@@ -105,11 +128,19 @@ class OrcaVisualCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             raise RuntimeError(f"Expected rendered frame shape {expected}, got {frame.shape}")
         return np.ascontiguousarray(frame.transpose(2, 0, 1))
 
-    def _proprio(self) -> np.ndarray:
+    def _joint_angles(self) -> np.ndarray:
         return np.asarray(
             self.env.data.qpos[self._actuator_qpos_indices],
             dtype=np.float32,
         ).copy()
+
+    def _proprio(self) -> np.ndarray:
+        joint_angles = self._joint_angles()
+        joint_ranges = self._joint_high - self._joint_low
+        if np.any(joint_ranges <= 0):
+            raise ValueError("Every actuated joint must have a positive ROM")
+        normalized = 2.0 * (joint_angles - self._joint_low) / joint_ranges - 1.0
+        return np.clip(normalized, -1.0, 1.0).astype(np.float32)
 
     def _observation(self) -> dict[str, np.ndarray]:
         return {
@@ -133,7 +164,7 @@ class OrcaVisualCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
                 cube_pos_xy_jitter=self.cube_pos_xy_jitter,
             )
         _, info = self.env.reset(seed=seed, options=reset_options)
-        self._target = np.clip(self._proprio(), self._joint_low, self._joint_high)
+        self._target = np.clip(self._joint_angles(), self._joint_low, self._joint_high)
         frame = self._render_chw()
         self._frames.clear()
         self._frames.extend(frame.copy() for _ in range(self.frame_stack))
@@ -144,13 +175,17 @@ class OrcaVisualCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         action: np.ndarray,
     ) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
         action = np.asarray(action, dtype=np.float32)
-        if action.shape != (17,):
-            raise ValueError(f"Expected normalized action shape (17,), got {action.shape}")
+        if action.shape != self.action_space.shape:
+            raise ValueError(
+                f"Expected normalized action shape {self.action_space.shape}, got {action.shape}"
+            )
         normalized = np.clip(action, -1.0, 1.0)
-        self._target = np.clip(
-            self._target + normalized * self.max_delta_radians,
-            self._joint_low,
-            self._joint_high,
+        active = self._active_actuator_indices
+        measured = self._joint_angles()
+        self._target[active] = np.clip(
+            measured[active] + normalized * self.max_delta_radians,
+            self._joint_low[active],
+            self._joint_high[active],
         ).astype(np.float32)
         _, reward, terminated, truncated, info = self.env.step(self._target)
         self._frames.append(self._render_chw())

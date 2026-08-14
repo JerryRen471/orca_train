@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -15,6 +16,59 @@ class ReplayBatch:
     discounts: torch.Tensor
     next_pixels: torch.Tensor
     next_proprio: torch.Tensor
+
+
+@dataclass(frozen=True)
+class Transition:
+    observation: dict[str, np.ndarray]
+    action: np.ndarray
+    reward: float
+    discount: float
+    next_observation: dict[str, np.ndarray]
+
+
+class NStepAccumulator:
+    def __init__(self, nstep: int, gamma: float):
+        if nstep <= 0:
+            raise ValueError("nstep must be positive")
+        self.nstep = int(nstep)
+        self.gamma = float(gamma)
+        self._pending: deque[tuple] = deque()
+
+    def add(
+        self,
+        observation: dict[str, np.ndarray],
+        action: np.ndarray,
+        reward: float,
+        next_observation: dict[str, np.ndarray],
+        terminated: bool,
+        episode_end: bool | None = None,
+    ) -> list[Transition]:
+        episode_end = terminated if episode_end is None else episode_end
+        self._pending.append(
+            (observation, np.asarray(action, dtype=np.float32).copy(), reward, next_observation, terminated)
+        )
+        transitions: list[Transition] = []
+        if len(self._pending) >= self.nstep:
+            transitions.append(self._build_transition(self.nstep))
+            self._pending.popleft()
+        if episode_end:
+            while self._pending:
+                transitions.append(self._build_transition(len(self._pending)))
+                self._pending.popleft()
+        return transitions
+
+    def _build_transition(self, length: int) -> Transition:
+        items = list(self._pending)[:length]
+        reward = 0.0
+        terminal = False
+        for index, (_, _, step_reward, _, step_terminated) in enumerate(items):
+            reward += self.gamma**index * float(step_reward)
+            terminal = terminal or bool(step_terminated)
+        observation, action, _, _, _ = items[0]
+        next_observation = items[-1][3]
+        discount = 0.0 if terminal else self.gamma**length
+        return Transition(observation, action, reward, discount, next_observation)
 
 
 class ReplayBuffer:
