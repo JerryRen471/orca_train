@@ -41,6 +41,8 @@ class TrainConfig:
     success_hold_steps: int = 10
     max_success_linear_speed: float = 0.15
     max_success_angular_speed: float = 2.0
+    target_sequence_length: int = 20
+    max_task_steps: int = 200
     reward_mode: str = "progress"
     progress_reward_scale: float = 5.0
     success_bonus: float = 10.0
@@ -63,10 +65,13 @@ def write_metric(path: Path, event: dict) -> None:
 
 
 @torch.no_grad()
-def evaluate(agent: DrQV2Agent, env, episodes: int, seed: int) -> dict[str, float]:
+def evaluate(agent: DrQV2Agent, env, episodes: int, seed: int) -> dict[str, float | int]:
     returns = []
     successes = []
     drops = []
+    timeouts = []
+    tasks_completed = []
+    completed_target_steps = []
     for episode in range(episodes):
         observation, _ = env.reset(seed=seed + episode)
         done = False
@@ -79,14 +84,24 @@ def evaluate(agent: DrQV2Agent, env, episodes: int, seed: int) -> dict[str, floa
             episode_return += reward
             success = success or bool(info.get("is_success", info.get("success", False)))
             dropped = dropped or bool(info.get("dropped", False))
+            if info.get("target_completed") and info.get("completed_target_steps") is not None:
+                completed_target_steps.append(int(info["completed_target_steps"]))
             done = terminated or truncated
         returns.append(episode_return)
         successes.append(success)
         drops.append(dropped)
+        timeouts.append(info.get("termination_reason") == "task_timeout")
+        tasks_completed.append(int(info.get("tasks_completed", int(success))))
     return {
         "return": float(np.mean(returns)),
         "success_rate": float(np.mean(successes)),
+        "mean_tasks_completed": float(np.mean(tasks_completed)),
+        "total_tasks_completed": int(np.sum(tasks_completed)),
         "drop_rate": float(np.mean(drops)),
+        "timeout_rate": float(np.mean(timeouts)),
+        "mean_steps_per_completed_target": (
+            float(np.mean(completed_target_steps)) if completed_target_steps else 0.0
+        ),
     }
 
 
@@ -115,6 +130,8 @@ def train(
             success_hold_steps=config.success_hold_steps,
             max_success_linear_speed=config.max_success_linear_speed,
             max_success_angular_speed=config.max_success_angular_speed,
+            target_sequence_length=config.target_sequence_length,
+            max_task_steps=config.max_task_steps,
             reward_mode=config.reward_mode,
             progress_reward_scale=config.progress_reward_scale,
             success_bonus=config.success_bonus,
@@ -183,6 +200,8 @@ def train(
                     "length": episode_length,
                     "success": bool(info.get("is_success", info.get("success", False))),
                     "dropped": bool(info.get("dropped", False)),
+                    "tasks_completed": int(info.get("tasks_completed", 0)),
+                    "termination_reason": info.get("termination_reason"),
                 })
                 observation, _ = env.reset()
                 episode_return = 0.0
@@ -206,7 +225,9 @@ def train(
 
 
 def parse_args() -> TrainConfig:
-    parser = argparse.ArgumentParser(description="Train DrQ-v2 to flip the Orca cube red face upward")
+    parser = argparse.ArgumentParser(
+        description="Train DrQ-v2 on goal-conditioned Orca cube orientation sequences"
+    )
     parser.add_argument("--total-steps", type=int, default=1_000_000)
     parser.add_argument("--seed-steps", type=int, default=5_000)
     parser.add_argument("--eval-every-steps", type=int, default=10_000)
@@ -228,6 +249,8 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--success-hold-steps", type=int, default=10)
     parser.add_argument("--max-success-linear-speed", type=float, default=0.15)
     parser.add_argument("--max-success-angular-speed", type=float, default=2.0)
+    parser.add_argument("--target-sequence-length", type=int, default=20)
+    parser.add_argument("--max-task-steps", type=int, default=200)
     parser.add_argument("--reward-mode", choices=("absolute", "progress"), default="progress")
     parser.add_argument("--progress-reward-scale", type=float, default=5.0)
     parser.add_argument("--success-bonus", type=float, default=10.0)

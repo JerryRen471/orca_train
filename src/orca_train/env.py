@@ -26,6 +26,8 @@ class OrcaVisualCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         randomize_reset: bool = True,
         cube_pos_xy_jitter: float = 0.01,
         fixed_joint_names: tuple[str, ...] = (),
+        target_sequence_length: int = 20,
+        max_task_steps: int = 200,
         drop_penalty: float = 1.0,
         drop_height: float = 0.10,
         success_height: float = 0.12,
@@ -53,6 +55,8 @@ class OrcaVisualCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
                 render_mode=None,
                 initial_red_face="down",
                 cube_pos_xy_jitter=cube_pos_xy_jitter,
+                target_sequence_length=target_sequence_length,
+                max_task_steps=max_task_steps,
                 drop_penalty=drop_penalty,
                 drop_height=drop_height,
                 success_height=success_height,
@@ -106,13 +110,14 @@ class OrcaVisualCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
                     shape=(3 * self.frame_stack, self.image_size, self.image_size),
                     dtype=np.uint8,
                 ),
-                "proprio": spaces.Box(-1.0, 1.0, shape=(17,), dtype=np.float32),
+                "proprio": spaces.Box(-1.0, 1.0, shape=(20,), dtype=np.float32),
             }
         )
 
         self._renderer = renderer if renderer is not None else self._make_renderer()
         self._frames: deque[np.ndarray] = deque(maxlen=self.frame_stack)
         self._target = np.zeros(17, dtype=np.float32)
+        self._target_direction = np.zeros(3, dtype=np.float32)
 
     def _make_renderer(self):
         import mujoco
@@ -150,7 +155,16 @@ class OrcaVisualCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         if np.any(joint_ranges <= 0):
             raise ValueError("Every actuated joint must have a positive ROM")
         normalized = 2.0 * (joint_angles - self._joint_low) / joint_ranges - 1.0
-        return np.clip(normalized, -1.0, 1.0).astype(np.float32)
+        normalized = np.clip(normalized, -1.0, 1.0).astype(np.float32)
+        return np.concatenate([normalized, self._target_direction])
+
+    def _update_target_direction(self, info: dict[str, Any]) -> None:
+        target_direction = np.asarray(info["target_direction"], dtype=np.float32)
+        if target_direction.shape != (3,):
+            raise ValueError(
+                f"Expected target_direction shape (3,), got {target_direction.shape}"
+            )
+        self._target_direction = target_direction.copy()
 
     def _observation(self) -> dict[str, np.ndarray]:
         return {
@@ -174,6 +188,7 @@ class OrcaVisualCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
                 cube_pos_xy_jitter=self.cube_pos_xy_jitter,
             )
         _, info = self.env.reset(seed=seed, options=reset_options)
+        self._update_target_direction(info)
         self._target = np.clip(self._joint_angles(), self._joint_low, self._joint_high)
         frame = self._render_chw()
         self._frames.clear()
@@ -198,6 +213,7 @@ class OrcaVisualCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             self._joint_high[active],
         ).astype(np.float32)
         _, reward, terminated, truncated, info = self.env.step(self._target)
+        self._update_target_direction(info)
         self._frames.append(self._render_chw())
         return self._observation(), float(reward), terminated, truncated, info
 
