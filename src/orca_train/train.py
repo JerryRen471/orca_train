@@ -36,6 +36,11 @@ class TrainConfig:
     hidden_dim: int = 1024
     fix_wrist: bool = False
     drop_penalty: float = 10.0
+    drop_height: float = 0.10
+    success_height: float = 0.12
+    success_hold_steps: int = 10
+    max_success_linear_speed: float = 0.15
+    max_success_angular_speed: float = 2.0
     reward_mode: str = "progress"
     progress_reward_scale: float = 5.0
     success_bonus: float = 10.0
@@ -105,6 +110,11 @@ def train(
             max_delta_degrees=config.max_delta_degrees,
             fixed_joint_names=fixed_joint_names,
             drop_penalty=config.drop_penalty,
+            drop_height=config.drop_height,
+            success_height=config.success_height,
+            success_hold_steps=config.success_hold_steps,
+            max_success_linear_speed=config.max_success_linear_speed,
+            max_success_angular_speed=config.max_success_angular_speed,
             reward_mode=config.reward_mode,
             progress_reward_scale=config.progress_reward_scale,
             success_bonus=config.success_bonus,
@@ -213,6 +223,11 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--max-delta-degrees", type=float, default=3.0)
     parser.add_argument("--fix-wrist", action="store_true")
     parser.add_argument("--drop-penalty", type=float, default=10.0)
+    parser.add_argument("--drop-height", type=float, default=0.10)
+    parser.add_argument("--success-height", type=float, default=0.12)
+    parser.add_argument("--success-hold-steps", type=int, default=10)
+    parser.add_argument("--max-success-linear-speed", type=float, default=0.15)
+    parser.add_argument("--max-success-angular-speed", type=float, default=2.0)
     parser.add_argument("--reward-mode", choices=("absolute", "progress"), default="progress")
     parser.add_argument("--progress-reward-scale", type=float, default=5.0)
     parser.add_argument("--success-bonus", type=float, default=10.0)

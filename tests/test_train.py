@@ -99,3 +99,8 @@ def test_corrected_training_defaults():
     assert config.eval_seed == 10_000
     assert config.reward_mode == "progress"
     assert config.drop_penalty == 10.0
+    assert config.drop_height == 0.10
+    assert config.success_height == 0.12
+    assert config.success_hold_steps == 10
+    assert config.max_success_linear_speed == 0.15
+    assert config.max_success_angular_speed == 2.0
