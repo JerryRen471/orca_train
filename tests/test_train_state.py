@@ -12,6 +12,7 @@ from orca_train.train_state import (
     resolve_preset,
     train_state,
 )
+from orca_train.state_agent import StateAgent, StateAgentConfig
 
 
 @pytest.mark.parametrize(
@@ -274,6 +275,8 @@ def test_state_training_loop_logs_updates_evaluation_and_checkpoints(tmp_path) -
     train_state(config, env_factory=factory)
 
     assert (tmp_path / "checkpoint_4.pt").exists()
+    restored = StateAgent(47, 16, "cpu", StateAgentConfig(hidden_dim=32))
+    assert restored.load(tmp_path / "checkpoint_4.pt") == 4
     saved_config = json.loads((tmp_path / "config.json").read_text())
     assert saved_config["target_policy"] == "fixed_quarter_turn"
     events = [
