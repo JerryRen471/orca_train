@@ -19,6 +19,15 @@ class ReplayBatch:
 
 
 @dataclass(frozen=True)
+class StateReplayBatch:
+    states: torch.Tensor
+    actions: torch.Tensor
+    rewards: torch.Tensor
+    discounts: torch.Tensor
+    next_states: torch.Tensor
+
+
+@dataclass(frozen=True)
 class Transition:
     observation: dict[str, np.ndarray]
     action: np.ndarray
@@ -129,6 +138,80 @@ class ReplayBuffer:
             discounts=tensor(self.discounts),
             next_pixels=torch.cat((pixels[:, 3:], next_frame), dim=1),
             next_proprio=tensor(self.next_proprio),
+        )
+
+    def __len__(self) -> int:
+        return self.size
+
+
+class StateReplayBuffer:
+    def __init__(
+        self,
+        capacity: int,
+        state_dim: int,
+        action_dim: int,
+        seed: int = 0,
+    ) -> None:
+        self.capacity = int(capacity)
+        self.state_dim = int(state_dim)
+        self.action_dim = int(action_dim)
+        self.rng = np.random.default_rng(seed)
+        self.states = np.empty((self.capacity, self.state_dim), dtype=np.float32)
+        self.actions = np.empty((self.capacity, self.action_dim), dtype=np.float32)
+        self.rewards = np.empty((self.capacity, 1), dtype=np.float32)
+        self.discounts = np.empty((self.capacity, 1), dtype=np.float32)
+        self.next_states = np.empty(
+            (self.capacity, self.state_dim), dtype=np.float32
+        )
+        self.size = 0
+        self.index = 0
+
+    def _state(self, observation: dict[str, np.ndarray]) -> np.ndarray:
+        state = np.asarray(observation["state"], dtype=np.float32)
+        if state.shape != (self.state_dim,):
+            raise ValueError(
+                f"Expected state shape {(self.state_dim,)}, got {state.shape}"
+            )
+        return state
+
+    def add(
+        self,
+        observation: dict[str, np.ndarray],
+        action: np.ndarray,
+        reward: float,
+        discount: float,
+        next_observation: dict[str, np.ndarray],
+    ) -> None:
+        index = self.index
+        action = np.asarray(action, dtype=np.float32)
+        if action.shape != (self.action_dim,):
+            raise ValueError(
+                f"Expected action shape {(self.action_dim,)}, got {action.shape}"
+            )
+        self.states[index] = self._state(observation)
+        self.actions[index] = action
+        self.rewards[index] = reward
+        self.discounts[index] = discount
+        self.next_states[index] = self._state(next_observation)
+        self.index = (index + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(
+        self, batch_size: int, device: torch.device
+    ) -> StateReplayBatch:
+        if self.size < batch_size:
+            raise ValueError(f"Replay has {self.size} items, need {batch_size}")
+        indices = self.rng.integers(0, self.size, size=batch_size)
+
+        def tensor(values: np.ndarray) -> torch.Tensor:
+            return torch.as_tensor(values[indices], device=device)
+
+        return StateReplayBatch(
+            states=tensor(self.states),
+            actions=tensor(self.actions),
+            rewards=tensor(self.rewards),
+            discounts=tensor(self.discounts),
+            next_states=tensor(self.next_states),
         )
 
     def __len__(self) -> int:
