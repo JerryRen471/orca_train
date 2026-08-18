@@ -100,8 +100,10 @@ uv run orca-train-state \
 
 Use `--device cuda` on an NVIDIA machine or `--device cpu` for a short
 debugging run. The resolved preset and every explicit override are written to
-`config.json`. Evaluation reports target counts, seconds per completed target,
-final/best angular error, drop/timeout rates, and 90°/120°/180° target buckets.
+`config.json`. Without `--output-dir`, runs are separated by preset and seed as
+`runs/state_cube_<preset>_seed<seed>`. Evaluation reports target counts, seconds
+per completed target, final/best angular error, drop/timeout rates, and
+90°/120°/180° target buckets.
 
 A four-step smoke run verifies environment construction, replay insertion,
 gradient updates, evaluation, checkpoint save, and checkpoint load. It does not

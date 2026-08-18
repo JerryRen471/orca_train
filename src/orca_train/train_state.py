@@ -31,7 +31,7 @@ class StateTrainConfig:
     gamma: float = 0.99
     seed: int = 1
     device: str = "auto"
-    output_dir: Path = Path("runs/state_cube_single_goal")
+    output_dir: Path | None = None
     resume: Path | None = None
     max_delta_degrees: float = 3.0
     hidden_dim: int = 1024
@@ -90,7 +90,10 @@ def resolve_preset(config: StateTrainConfig) -> StateTrainConfig:
         field: getattr(config, field) if getattr(config, field) is not None else value
         for field, value in defaults.items()
     }
-    return replace(config, **resolved)
+    output_dir = config.output_dir or Path(
+        f"runs/state_cube_{config.preset}_seed{config.seed}"
+    )
+    return replace(config, output_dir=output_dir, **resolved)
 
 
 def _rotation_bucket(angle_rad: float) -> str | None:
@@ -219,6 +222,8 @@ def train_state(
     env_factory: Callable[[], object] | None = None,
 ) -> None:
     config = resolve_preset(config)
+    if config.output_dir is None:
+        raise RuntimeError("Resolved state training output directory is missing")
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
@@ -398,9 +403,7 @@ def parse_args(argv: list[str] | None = None) -> StateTrainConfig:
     parser.add_argument(
         "--device", default="auto", choices=("auto", "cpu", "mps", "cuda")
     )
-    parser.add_argument(
-        "--output-dir", type=Path, default=Path("runs/state_cube_single_goal")
-    )
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--max-delta-degrees", type=float, default=3.0)
     parser.add_argument("--hidden-dim", type=int, default=1024)

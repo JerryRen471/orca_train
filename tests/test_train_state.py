@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -38,6 +39,19 @@ def test_state_curriculum_presets_resolve_exact_task_settings(
 def test_state_curriculum_rejects_unknown_preset() -> None:
     with pytest.raises(ValueError, match="Unknown state curriculum preset"):
         resolve_preset(StateTrainConfig(preset="unknown"))
+
+
+def test_state_curriculum_derives_distinct_default_run_directories() -> None:
+    resolved = {
+        preset: resolve_preset(StateTrainConfig(preset=preset, seed=7)).output_dir
+        for preset in ("single_goal", "right_angle", "multi_goal")
+    }
+
+    assert resolved == {
+        "single_goal": Path("runs/state_cube_single_goal_seed7"),
+        "right_angle": Path("runs/state_cube_right_angle_seed7"),
+        "multi_goal": Path("runs/state_cube_multi_goal_seed7"),
+    }
 
 
 def test_explicit_task_values_override_curriculum_defaults() -> None:
