@@ -23,6 +23,7 @@ dev = ["pytest>=8"]
 
 [project.scripts]
 orca-train-drqv2 = "orca_train.train:main"
+orca-train-state = "orca_train.train_state:main"
 orca-visualize-checkpoint = "orca_train.visualize:main"
 
 [tool.hatch.build.targets.wheel]
