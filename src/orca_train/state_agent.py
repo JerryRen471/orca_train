@@ -62,9 +62,14 @@ class StateAgent:
         step: int,
         eval_mode: bool = False,
     ) -> np.ndarray:
-        state = torch.as_tensor(
-            observation["state"], device=self.device
-        ).unsqueeze(0)
+        state_array = np.asarray(observation["state"], dtype=np.float32)
+        if state_array.shape != (self.state_dim,):
+            raise ValueError(
+                f"Expected state shape ({self.state_dim},), got {state_array.shape}"
+            )
+        if not np.all(np.isfinite(state_array)):
+            raise ValueError("State observation must contain only finite values")
+        state = torch.as_tensor(state_array, device=self.device).unsqueeze(0)
         action = self.actor(state)
         if not eval_mode:
             stddev = schedule(self.config.stddev_schedule, step)
@@ -150,6 +155,13 @@ class StateAgent:
                     f"Incompatible checkpoint {field}: expected {expected!r}, "
                     f"got {actual!r}"
                 )
+        checkpoint_config = state.get("config", {})
+        checkpoint_hidden_dim = checkpoint_config.get("hidden_dim")
+        if checkpoint_hidden_dim != self.config.hidden_dim:
+            raise ValueError(
+                "Incompatible checkpoint hidden_dim: expected "
+                f"{self.config.hidden_dim!r}, got {checkpoint_hidden_dim!r}"
+            )
         for name in ("actor", "critic", "critic_target"):
             getattr(self, name).load_state_dict(state[name])
         for name in ("actor_optimizer", "critic_optimizer"):

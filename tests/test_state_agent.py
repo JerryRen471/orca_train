@@ -94,6 +94,31 @@ def test_state_agent_action_and_single_update() -> None:
     assert all(np.isfinite(value) for value in metrics.values())
 
 
+def test_state_agent_action_validates_and_coerces_state() -> None:
+    agent = StateAgent(
+        47,
+        16,
+        "cpu",
+        StateAgentConfig(hidden_dim=32),
+    )
+
+    action = agent.act(
+        {"state": np.zeros(47, dtype=np.float64)},
+        step=0,
+        eval_mode=True,
+    )
+    assert action.dtype == np.float32
+
+    with pytest.raises(ValueError, match="state shape"):
+        agent.act({"state": np.zeros(46)}, step=0, eval_mode=True)
+    with pytest.raises(ValueError, match="finite"):
+        agent.act(
+            {"state": np.full(47, np.nan)},
+            step=0,
+            eval_mode=True,
+        )
+
+
 def test_state_agent_checkpoint_round_trip_includes_dimensions(tmp_path) -> None:
     config = StateAgentConfig(hidden_dim=32, batch_size=2)
     agent = StateAgent(47, 16, "cpu", config)
@@ -133,3 +158,21 @@ def test_state_agent_checkpoint_rejects_incompatible_metadata(
 
     with pytest.raises(ValueError, match=field):
         StateAgent(47, 16, "cpu", config).load(checkpoint)
+
+
+def test_state_agent_checkpoint_rejects_incompatible_hidden_dim(tmp_path) -> None:
+    checkpoint = tmp_path / "hidden_dim.pt"
+    StateAgent(
+        47,
+        16,
+        "cpu",
+        StateAgentConfig(hidden_dim=32),
+    ).save(checkpoint, step=7)
+
+    with pytest.raises(ValueError, match="hidden_dim"):
+        StateAgent(
+            47,
+            16,
+            "cpu",
+            StateAgentConfig(hidden_dim=64),
+        ).load(checkpoint)
