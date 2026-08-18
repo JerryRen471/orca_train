@@ -20,6 +20,7 @@ class OrcaStateCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         max_delta_degrees: float = 3.0,
         fixed_joint_names: tuple[str, ...] = (),
         hand_mount_body_name: str = "right_mount",
+        cube_body_name: str = "task_cube",
         joint_velocity_limit: float = 10.0,
         workspace_radius: float = 0.25,
         linear_velocity_limit: float = 2.0,
@@ -43,6 +44,7 @@ class OrcaStateCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
 
             task_kwargs.setdefault("goal_mode", "cube_orientation")
             task_kwargs.setdefault("hand_mount_body_name", hand_mount_body_name)
+            task_kwargs.setdefault("cube_body_name", cube_body_name)
             env = OrcaHandRightCubeOrientation(version=version, **task_kwargs)
 
         self.env = env
@@ -83,6 +85,7 @@ class OrcaStateCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             dtype=np.int32,
         )
         self._hand_mount_body_id = model.body(hand_mount_body_name).id
+        self._cube_body_id = model.body(cube_body_name).id
 
         self.action_space = spaces.Box(
             -1.0,
@@ -120,6 +123,9 @@ class OrcaStateCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         mount_rotation = np.asarray(
             self.env.data.xmat[self._hand_mount_body_id], dtype=np.float64
         ).reshape(3, 3)
+        cube_rotation = np.asarray(
+            self.env.data.xmat[self._cube_body_id], dtype=np.float64
+        ).reshape(3, 3)
         cube_position = np.asarray(info["cube_pos"], dtype=np.float64)
         cube_velocity = np.asarray(info["cube_qvel"], dtype=np.float64)
         if cube_position.shape != (3,):
@@ -134,7 +140,7 @@ class OrcaStateCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             mount_rotation.T @ cube_velocity[:3]
         ) / self.linear_velocity_limit
         angular_velocity_in_hand = (
-            mount_rotation.T @ cube_velocity[3:]
+            mount_rotation.T @ cube_rotation @ cube_velocity[3:]
         ) / self.angular_velocity_limit
         relative_target = canonicalize_quaternion(
             np.asarray(info["relative_target_quat"], dtype=np.float64)

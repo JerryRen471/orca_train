@@ -31,13 +31,20 @@ class _FakeStateCubeEnv(gym.Env):
             jnt_qposadr=np.arange(17, dtype=np.int32),
             jnt_dofadr=np.arange(17, dtype=np.int32),
             joint=lambda joint_id: SimpleNamespace(name=joint_names[joint_id]),
-            body=lambda name: SimpleNamespace(id=0),
+            body=lambda name: SimpleNamespace(
+                id={"right_mount": 0, "task_cube": 1}[name]
+            ),
         )
         self.data = SimpleNamespace(
             qpos=np.linspace(-0.25, 0.25, 17),
             qvel=np.linspace(-10.0, 10.0, 17),
-            xpos=np.array([self.MOUNT_POS]),
-            xmat=np.array([self.MOUNT_ROTATION.reshape(-1)]),
+            xpos=np.array([self.MOUNT_POS, np.zeros(3)]),
+            xmat=np.array(
+                [
+                    self.MOUNT_ROTATION.reshape(-1),
+                    self.MOUNT_ROTATION.reshape(-1),
+                ]
+            ),
         )
         self.last_action = None
 
@@ -48,7 +55,7 @@ class _FakeStateCubeEnv(gym.Env):
             "cube_qvel": np.concatenate(
                 [
                     rotation @ self.LOCAL_LINEAR_VELOCITY,
-                    rotation @ self.LOCAL_ANGULAR_VELOCITY,
+                    self.LOCAL_ANGULAR_VELOCITY,
                 ]
             ),
             "relative_target_quat": self.RELATIVE_TARGET_QUAT.copy(),
