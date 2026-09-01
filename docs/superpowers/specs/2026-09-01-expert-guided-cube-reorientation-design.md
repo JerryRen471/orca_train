@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-01
 
-**Status:** Approved in chat; pending written-spec review
+**Status:** Approved
 
 **Repositories:** `orca_train`, `orca_sim`
 
@@ -200,8 +200,10 @@ Two actors with the production `(512, 256, 128)` architecture are trained:
 
 BC optimizes only the policy action mean with Huber loss on the normalized
 16-dimensional action. It does not train a critic and never reads the
-131-dimensional privileged state. The policy log standard deviation is kept
-from the selected initialization and is not part of the BC loss.
+131-dimensional privileged state. The production Brax tanh-normal actor emits
+mean and scale logits from one network; BC supervises only the distribution
+mode, so scale logits receive no direct loss. The full actor is retained for
+subsequent PPO rather than replacing it with a BC-specific output head.
 
 Both candidates are evaluated in the exact Warp/MJX environment, along with
 the frozen original PPO baseline, on hold, `10-15 deg`, `30 deg`, `60 deg`,
@@ -349,7 +351,7 @@ The PPO student restores:
 
 - the BC actor parameters;
 - the BC actor observation-normalization statistics; and
-- the configured policy log standard deviation.
+- the complete production actor, including its scale-logit outputs.
 
 The 131-dimensional critic and its optimizer state are freshly initialized.
 The actor can access only `state` with 57 dimensions; the value network alone
