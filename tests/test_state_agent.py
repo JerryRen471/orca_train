@@ -119,6 +119,51 @@ def test_state_agent_action_validates_and_coerces_state() -> None:
         )
 
 
+def test_state_agent_behavior_noise_uses_configured_clip() -> None:
+    config = StateAgentConfig(
+        hidden_dim=32,
+        stddev_schedule="1.0",
+        stddev_clip=0.2,
+    )
+    agent = StateAgent(47, 16, "cpu", config)
+    for parameter in agent.actor.parameters():
+        parameter.data.zero_()
+
+    torch.manual_seed(0)
+    action = agent.act(state_observation(), step=0)
+
+    assert np.max(np.abs(action)) <= 0.2 + 1e-7
+
+
+def test_state_agent_defaults_use_survivable_exploration_schedule() -> None:
+    config = StateAgentConfig()
+
+    assert config.stddev_schedule == "linear(0.2,0.05,100000)"
+    assert config.stddev_clip == pytest.approx(0.2)
+
+
+@pytest.mark.parametrize("clip", [-0.1, np.inf, np.nan])
+def test_state_agent_rejects_invalid_noise_clip(clip) -> None:
+    with pytest.raises(ValueError, match="stddev_clip"):
+        StateAgentConfig(stddev_clip=clip)
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "nan",
+        "-0.1",
+        "linear(0.2,0.05,0)",
+        "linear(0.2,0.05,-1)",
+        "linear(nan,0.05,100)",
+        "not-a-schedule",
+    ],
+)
+def test_state_agent_rejects_invalid_noise_schedule(spec) -> None:
+    with pytest.raises(ValueError, match="stddev_schedule"):
+        StateAgentConfig(stddev_schedule=spec)
+
+
 def test_state_agent_checkpoint_round_trip_includes_dimensions(tmp_path) -> None:
     config = StateAgentConfig(hidden_dim=32, batch_size=2)
     agent = StateAgent(47, 16, "cpu", config)

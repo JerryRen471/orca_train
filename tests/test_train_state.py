@@ -16,20 +16,36 @@ from orca_train.state_agent import StateAgent, StateAgentConfig
 
 
 @pytest.mark.parametrize(
-    ("preset", "target_policy", "sequence_length", "tolerance_rad"),
+    (
+        "preset",
+        "target_policy",
+        "sequence_length",
+        "target_angle_rad",
+        "tolerance_rad",
+    ),
     [
-        ("single_goal", "fixed_quarter_turn", 1, 0.4),
-        ("right_angle", "random_quarter_turn", 1, 0.4),
-        ("multi_goal", "cube_orientation_bag", 20, np.deg2rad(15.0)),
+        ("turn_30", "fixed_quarter_turn", 1, np.deg2rad(30.0), np.deg2rad(15.0)),
+        ("turn_45", "fixed_quarter_turn", 1, np.deg2rad(45.0), np.deg2rad(15.0)),
+        ("turn_60", "fixed_quarter_turn", 1, np.deg2rad(60.0), np.deg2rad(15.0)),
+        ("single_goal", "fixed_quarter_turn", 1, np.pi / 2.0, 0.4),
+        ("right_angle", "random_quarter_turn", 1, np.pi / 2.0, 0.4),
+        (
+            "multi_goal",
+            "cube_orientation_bag",
+            20,
+            np.pi / 2.0,
+            np.deg2rad(15.0),
+        ),
     ],
 )
 def test_state_curriculum_presets_resolve_exact_task_settings(
-    preset, target_policy, sequence_length, tolerance_rad
+    preset, target_policy, sequence_length, target_angle_rad, tolerance_rad
 ) -> None:
     resolved = resolve_preset(StateTrainConfig(preset=preset))
 
     assert resolved.target_policy == target_policy
     assert resolved.target_sequence_length == sequence_length
+    assert resolved.target_rotation_angle_rad == pytest.approx(target_angle_rad)
     assert resolved.success_tolerance_rad == pytest.approx(tolerance_rad)
     assert resolved.control_period_s == pytest.approx(0.08)
     assert resolved.max_task_duration_s == pytest.approx(8.0)
@@ -42,13 +58,40 @@ def test_state_curriculum_rejects_unknown_preset() -> None:
         resolve_preset(StateTrainConfig(preset="unknown"))
 
 
+@pytest.mark.parametrize("scale", [-0.1, 1.1, np.inf, np.nan])
+def test_state_training_rejects_invalid_seed_action_scale(scale) -> None:
+    with pytest.raises(ValueError, match="seed_action_scale"):
+        StateTrainConfig(seed_action_scale=scale)
+
+
+@pytest.mark.parametrize("clip", [-0.1, np.inf, np.nan])
+def test_state_training_rejects_invalid_behavior_noise_clip(clip) -> None:
+    with pytest.raises(ValueError, match="behavior_stddev_clip"):
+        StateTrainConfig(behavior_stddev_clip=clip)
+
+
+def test_state_training_rejects_invalid_behavior_noise_schedule() -> None:
+    with pytest.raises(ValueError, match="behavior_stddev_schedule"):
+        StateTrainConfig(behavior_stddev_schedule="linear(0.2,0.05,0)")
+
+
 def test_state_curriculum_derives_distinct_default_run_directories() -> None:
     resolved = {
         preset: resolve_preset(StateTrainConfig(preset=preset, seed=7)).output_dir
-        for preset in ("single_goal", "right_angle", "multi_goal")
+        for preset in (
+            "turn_30",
+            "turn_45",
+            "turn_60",
+            "single_goal",
+            "right_angle",
+            "multi_goal",
+        )
     }
 
     assert resolved == {
+        "turn_30": Path("runs/state_cube_turn_30_seed7"),
+        "turn_45": Path("runs/state_cube_turn_45_seed7"),
+        "turn_60": Path("runs/state_cube_turn_60_seed7"),
         "single_goal": Path("runs/state_cube_single_goal_seed7"),
         "right_angle": Path("runs/state_cube_right_angle_seed7"),
         "multi_goal": Path("runs/state_cube_multi_goal_seed7"),
@@ -61,6 +104,7 @@ def test_explicit_task_values_override_curriculum_defaults() -> None:
             preset="multi_goal",
             target_policy="fixed_quarter_turn",
             target_sequence_length=3,
+            target_rotation_angle_rad=0.7,
             success_tolerance_rad=0.2,
             control_period_s=0.04,
             max_task_duration_s=4.0,
@@ -71,6 +115,7 @@ def test_explicit_task_values_override_curriculum_defaults() -> None:
 
     assert resolved.target_policy == "fixed_quarter_turn"
     assert resolved.target_sequence_length == 3
+    assert resolved.target_rotation_angle_rad == pytest.approx(0.7)
     assert resolved.success_tolerance_rad == pytest.approx(0.2)
     assert resolved.control_period_s == pytest.approx(0.04)
     assert resolved.max_task_duration_s == pytest.approx(4.0)
@@ -106,6 +151,12 @@ class _EvaluationStateEnv:
         return self._observation(), {
             "target_rotation_angle_rad": angle,
             "orientation_error_rad": error,
+            "success_tolerance_rad": 0.4,
+            "cube_pos": np.array([0.0, 0.0, 0.14]),
+            "cube_linear_speed": 0.2,
+            "cube_angular_speed": 2.5,
+            "cube_hand_contact_count": 1,
+            "stable_success_steps": 0,
         }
 
     def step(self, action):
@@ -116,9 +167,17 @@ class _EvaluationStateEnv:
             "target_completed": False,
             "completed_target_steps": None,
             "completed_target_rotation_angle_rad": None,
+            "completed_target_orientation_error_rad": None,
             "tasks_completed": 0,
             "termination_reason": None,
             "control_period_s": 0.08,
+            "success_tolerance_rad": 0.4,
+            "cube_pos": np.array([0.0, 0.0, 0.14]),
+            "cube_linear_speed": 0.1,
+            "cube_angular_speed": 1.5,
+            "cube_hand_contact_count": 2,
+            "stable_success_steps": 0,
+            "success_hold_steps": 2,
         }
         terminated = False
         if self.seed == 100 and self.steps == 1:
@@ -128,7 +187,9 @@ class _EvaluationStateEnv:
                 completed_target_rotation_angle_rad=np.pi / 2.0,
                 target_rotation_angle_rad=2.0 * np.pi / 3.0,
                 orientation_error_rad=0.4,
+                completed_target_orientation_error_rad=0.4,
                 tasks_completed=1,
+                stable_success_steps=1,
             )
         elif self.seed == 100:
             info.update(
@@ -138,8 +199,10 @@ class _EvaluationStateEnv:
                 completed_target_rotation_angle_rad=2.0 * np.pi / 3.0,
                 target_rotation_angle_rad=2.0 * np.pi / 3.0,
                 orientation_error_rad=0.1,
+                completed_target_orientation_error_rad=0.1,
                 tasks_completed=2,
                 termination_reason="sequence_complete",
+                stable_success_steps=2,
             )
             terminated = True
         elif self.seed == 101 and self.steps == 1:
@@ -149,6 +212,7 @@ class _EvaluationStateEnv:
                 completed_target_rotation_angle_rad=np.pi,
                 target_rotation_angle_rad=np.pi / 2.0,
                 orientation_error_rad=0.5,
+                completed_target_orientation_error_rad=0.2,
                 tasks_completed=1,
             )
         elif self.seed == 101:
@@ -178,6 +242,8 @@ def test_state_evaluation_reports_orientation_and_rotation_bucket_metrics() -> N
     assert env.reset_seeds == [100, 101, 102]
     assert result["return"] == pytest.approx(5.0 / 3.0)
     assert result["success_rate"] == pytest.approx(1.0 / 3.0)
+    assert result["success_rate_ci95"]["lower"] <= result["success_rate"]
+    assert result["success_rate_ci95"]["upper"] >= result["success_rate"]
     assert result["mean_targets_completed"] == pytest.approx(1.0)
     assert result["median_targets_completed"] == pytest.approx(1.0)
     assert result["total_targets_completed"] == 3
@@ -186,7 +252,19 @@ def test_state_evaluation_reports_orientation_and_rotation_bucket_metrics() -> N
     assert result["mean_seconds_per_completed_target"] == pytest.approx(0.24)
     assert result["median_seconds_per_completed_target"] == pytest.approx(0.24)
     assert result["mean_final_orientation_error_rad"] == pytest.approx(1.9 / 3.0)
-    assert result["mean_best_orientation_error_rad"] == pytest.approx(1.4 / 3.0)
+    assert result["mean_best_orientation_error_rad"] == pytest.approx(1.1 / 3.0)
+    assert result["funnel"] == {
+        "reached_error_60deg_rate": 1.0,
+        "reached_error_45deg_rate": pytest.approx(2.0 / 3.0),
+        "reached_error_30deg_rate": pytest.approx(2.0 / 3.0),
+        "reached_success_tolerance_rate": pytest.approx(2.0 / 3.0),
+        "mean_max_stable_success_steps": pytest.approx(4.0 / 3.0),
+        "mean_drop_step": pytest.approx(2.0),
+        "mean_success_tolerance_cube_height_m": pytest.approx(0.14),
+        "mean_success_tolerance_linear_speed": pytest.approx(0.1),
+        "mean_success_tolerance_angular_speed": pytest.approx(1.5),
+        "mean_success_tolerance_hand_contact_count": pytest.approx(2.0),
+    }
     assert result["rotation_buckets"] == {
         "90": {
             "attempts": 2,
@@ -215,6 +293,7 @@ class _TinyStateEnv:
         self.steps = 0
         self.closed = False
         self.action_shapes = []
+        self.actions = []
 
     @staticmethod
     def _observation(value=0.0):
@@ -225,10 +304,17 @@ class _TinyStateEnv:
         return self._observation(), {
             "target_rotation_angle_rad": np.pi / 2.0,
             "orientation_error_rad": 1.0,
+            "success_tolerance_rad": 0.4,
+            "cube_pos": np.array([0.0, 0.0, 0.14]),
+            "cube_linear_speed": 0.0,
+            "cube_angular_speed": 0.0,
+            "cube_hand_contact_count": 2,
+            "stable_success_steps": 0,
         }
 
     def step(self, action):
         self.action_shapes.append(action.shape)
+        self.actions.append(np.array(action, copy=True))
         self.steps += 1
         terminated = self.steps == 2
         info = {
@@ -244,6 +330,12 @@ class _TinyStateEnv:
             "control_period_s": 0.08,
             "tasks_completed": 1 if terminated else 0,
             "termination_reason": "sequence_complete" if terminated else None,
+            "success_tolerance_rad": 0.4,
+            "cube_pos": np.array([0.0, 0.0, 0.14]),
+            "cube_linear_speed": 0.0,
+            "cube_angular_speed": 0.0,
+            "cube_hand_contact_count": 2,
+            "stable_success_steps": self.steps,
         }
         return self._observation(self.steps / 10.0), 1.0, terminated, False, info
 
@@ -286,10 +378,38 @@ def test_state_training_loop_logs_updates_evaluation_and_checkpoints(tmp_path) -
     assert any(event["type"] == "update" for event in events)
     assert any(event["type"] == "evaluation" for event in events)
     assert any(event["type"] == "train_episode" for event in events)
+    train_events = [event for event in events if event["type"] == "train_episode"]
+    evaluation_events = [event for event in events if event["type"] == "evaluation"]
+    assert all(
+        event["funnel"]["mean_drop_step"] is None
+        for event in evaluation_events
+    )
+    assert all(event["reached_error_60deg"] for event in train_events)
+    assert all(event["reached_success_tolerance"] for event in train_events)
+    assert all(event["max_stable_success_steps"] == 2 for event in train_events)
+    assert all(
+        event["success_tolerance_hand_contact_count"] == 2
+        for event in train_events
+    )
     assert all(env.closed for env in environments)
     assert all(
         shape == (16,) for env in environments for shape in env.action_shapes
     )
+    assert all(
+        np.max(np.abs(action)) <= 0.1
+        for action in environments[0].actions[: config.seed_steps]
+    )
+
+
+def test_state_training_exploration_defaults_match_survival_first_policy() -> None:
+    config = StateTrainConfig()
+
+    assert config.eval_episodes == 100
+    assert config.seed_action_scale == pytest.approx(0.1)
+    assert config.behavior_stddev_schedule == "linear(0.2,0.05,100000)"
+    assert config.behavior_stddev_clip == pytest.approx(0.2)
+    assert config.gate_orientation_progress_on_grasp
+    assert config.grasp_height_reward_scale == pytest.approx(0.01)
 
 
 def test_state_cli_parses_explicit_curriculum_overrides(tmp_path) -> None:
@@ -301,6 +421,8 @@ def test_state_cli_parses_explicit_curriculum_overrides(tmp_path) -> None:
             "fixed_quarter_turn",
             "--target-sequence-length",
             "3",
+            "--target-rotation-degrees",
+            "45",
             "--success-tolerance-degrees",
             "30",
             "--control-period-s",
@@ -317,6 +439,7 @@ def test_state_cli_parses_explicit_curriculum_overrides(tmp_path) -> None:
     assert config.preset == "multi_goal"
     assert config.target_policy == "fixed_quarter_turn"
     assert config.target_sequence_length == 3
+    assert config.target_rotation_angle_rad == pytest.approx(np.pi / 4.0)
     assert config.success_tolerance_rad == pytest.approx(np.pi / 6.0)
     assert config.control_period_s == pytest.approx(0.04)
     assert config.max_task_duration_s == pytest.approx(4.0)

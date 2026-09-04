@@ -36,6 +36,9 @@ The static curricula are:
 
 | Preset | Target policy | Sequence | Tolerance | Target duration | Hold | Control period |
 |---|---|---:|---:|---:|---:|---:|
+| `turn_30` | fixed +30° hand-X turn | 1 | 15° | 8.0 s | 0.16 s | 0.08 s |
+| `turn_45` | fixed +45° hand-X turn | 1 | 15° | 8.0 s | 0.16 s | 0.08 s |
+| `turn_60` | fixed +60° hand-X turn | 1 | 15° | 8.0 s | 0.16 s | 0.08 s |
 | `single_goal` | fixed +90° hand-X turn | 1 | 0.4 rad | 8.0 s | 0.16 s | 0.08 s |
 | `right_angle` | random ±90° hand axis | 1 | 0.4 rad | 8.0 s | 0.16 s | 0.08 s |
 | `multi_goal` | shuffled 24-orientation bag | 20 | 15° | 8.0 s | 0.16 s | 0.08 s |
@@ -87,23 +90,36 @@ uv run orca-train-drqv2 \
 
 ## Train the state baseline
 
-Start with the deterministic single-goal curriculum:
+Start with the 30° curriculum and advance through `turn_45`, `turn_60`,
+`single_goal`, `right_angle`, then `multi_goal` after each stage reaches a
+stable evaluation success rate:
 
 ```bash
 cd /Users/jerry/Code/orca_train
 uv run orca-train-state \
-  --preset single_goal \
+  --preset turn_30 \
   --device mps \
   --total-steps 1000000 \
-  --output-dir runs/state_cube_single_goal_seed1
+  --eval-episodes 100 \
+  --output-dir runs/state_cube_turn_30_seed1
 ```
 
 Use `--device cuda` on an NVIDIA machine or `--device cpu` for a short
 debugging run. The resolved preset and every explicit override are written to
 `config.json`. Without `--output-dir`, runs are separated by preset and seed as
 `runs/state_cube_<preset>_seed<seed>`. Evaluation reports target counts, seconds
-per completed target, final/best angular error, drop/timeout rates, and
-90°/120°/180° target buckets.
+per completed target, final/best angular error, drop/timeout rates, a 95% Wilson
+interval for success rate, and
+90°/120°/180° target buckets. It also records the 60°/45°/30°/success-tolerance
+funnel, drop step, maximum stable-success streak, and the cube height and speed
+when the tolerance is first reached. Evaluation defaults to 100 fixed-seed
+episodes; event-conditioned means are `null` when no matching event occurred.
+
+The default exploration policy uses `linear(0.2,0.05,100000)` Gaussian noise
+clipped to `0.2`; the replay warm-up samples only within `±0.1`. Angular progress
+is gated on both cube height and hand contact, with a `0.01` height-hold shaping
+reward. These values can be overridden with the corresponding command-line
+options for controlled ablations.
 
 A four-step smoke run verifies environment construction, replay insertion,
 gradient updates, evaluation, checkpoint save, and checkpoint load. It does not

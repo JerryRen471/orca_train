@@ -16,11 +16,26 @@ from .replay import ReplayBuffer
 
 def schedule(spec: str | float, step: int) -> float:
     if isinstance(spec, (float, int)):
-        return float(spec)
+        value = float(spec)
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError("Schedule value must be finite and non-negative")
+        return value
     match = re.fullmatch(r"linear\(([^,]+),([^,]+),([^,]+)\)", spec)
     if not match:
-        return float(spec)
+        try:
+            value = float(spec)
+        except ValueError as error:
+            raise ValueError(f"Invalid schedule: {spec!r}") from error
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError("Schedule value must be finite and non-negative")
+        return value
     start, end, duration = map(float, match.groups())
+    if not all(math.isfinite(value) for value in (start, end, duration)):
+        raise ValueError("Linear schedule values must be finite")
+    if start < 0.0 or end < 0.0 or duration <= 0.0:
+        raise ValueError(
+            "Linear schedule endpoints must be non-negative and duration positive"
+        )
     mix = np.clip(step / duration, 0.0, 1.0)
     return float((1.0 - mix) * start + mix * end)
 

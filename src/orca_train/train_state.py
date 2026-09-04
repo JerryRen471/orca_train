@@ -10,6 +10,7 @@ from typing import Callable
 import numpy as np
 import torch
 
+from .agent import schedule
 from .replay import NStepAccumulator, StateReplayBuffer
 from .state_agent import StateAgent, StateAgentConfig
 from .state_env import OrcaStateCubeEnv
@@ -21,8 +22,11 @@ class StateTrainConfig:
     preset: str = "single_goal"
     total_steps: int = 1_000_000
     seed_steps: int = 5_000
+    seed_action_scale: float = 0.1
+    behavior_stddev_schedule: str = "linear(0.2,0.05,100000)"
+    behavior_stddev_clip: float = 0.2
     eval_every_steps: int = 10_000
-    eval_episodes: int = 20
+    eval_episodes: int = 100
     eval_seed: int = 10_000
     checkpoint_every_steps: int = 50_000
     replay_capacity: int = 200_000
@@ -48,32 +52,181 @@ class StateTrainConfig:
     progress_reward_scale: float = 5.0
     success_bonus: float = 10.0
     step_penalty: float = 0.01
+    gate_orientation_progress_on_grasp: bool = True
+    grasp_height_reward_scale: float = 0.01
     target_policy: str | None = None
     target_sequence_length: int | None = None
+    target_rotation_angle_rad: float | None = None
     success_tolerance_rad: float | None = None
     control_period_s: float | None = None
     max_task_duration_s: float | None = None
     success_hold_duration_s: float | None = None
     reward_mode: str | None = None
 
+    def __post_init__(self) -> None:
+        if not (
+            np.isfinite(self.seed_action_scale)
+            and 0.0 <= self.seed_action_scale <= 1.0
+        ):
+            raise ValueError("seed_action_scale must be finite and within [0, 1]")
+        if not (
+            np.isfinite(self.behavior_stddev_clip)
+            and self.behavior_stddev_clip >= 0.0
+        ):
+            raise ValueError(
+                "behavior_stddev_clip must be finite and non-negative"
+            )
+        try:
+            schedule(self.behavior_stddev_schedule, step=0)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "behavior_stddev_schedule must be a valid non-negative schedule"
+            ) from error
+
 
 _PRESETS = {
+    "turn_30": {
+        "target_policy": "fixed_quarter_turn",
+        "target_sequence_length": 1,
+        "target_rotation_angle_rad": float(np.deg2rad(30.0)),
+        "success_tolerance_rad": float(np.deg2rad(15.0)),
+    },
+    "turn_45": {
+        "target_policy": "fixed_quarter_turn",
+        "target_sequence_length": 1,
+        "target_rotation_angle_rad": float(np.deg2rad(45.0)),
+        "success_tolerance_rad": float(np.deg2rad(15.0)),
+    },
+    "turn_60": {
+        "target_policy": "fixed_quarter_turn",
+        "target_sequence_length": 1,
+        "target_rotation_angle_rad": float(np.deg2rad(60.0)),
+        "success_tolerance_rad": float(np.deg2rad(15.0)),
+    },
     "single_goal": {
         "target_policy": "fixed_quarter_turn",
         "target_sequence_length": 1,
+        "target_rotation_angle_rad": np.pi / 2.0,
         "success_tolerance_rad": 0.4,
     },
     "right_angle": {
         "target_policy": "random_quarter_turn",
         "target_sequence_length": 1,
+        "target_rotation_angle_rad": np.pi / 2.0,
         "success_tolerance_rad": 0.4,
     },
     "multi_goal": {
         "target_policy": "cube_orientation_bag",
         "target_sequence_length": 20,
+        "target_rotation_angle_rad": np.pi / 2.0,
         "success_tolerance_rad": float(np.deg2rad(15.0)),
     },
 }
+
+
+@dataclass
+class _EpisodeFunnel:
+    success_tolerance_rad: float
+    best_orientation_error_rad: float = float("inf")
+    reached_error_60deg: bool = False
+    reached_error_45deg: bool = False
+    reached_error_30deg: bool = False
+    reached_success_tolerance: bool = False
+    max_stable_success_steps: int = 0
+    drop_step: int | None = None
+    success_tolerance_cube_height_m: float | None = None
+    success_tolerance_linear_speed: float | None = None
+    success_tolerance_angular_speed: float | None = None
+    success_tolerance_hand_contact_count: int | None = None
+
+    def observe(self, info: dict, episode_step: int) -> None:
+        errors = [info.get("orientation_error_rad")]
+        completed_error = info.get("completed_target_orientation_error_rad")
+        if completed_error is not None:
+            errors.append(completed_error)
+        for error in errors:
+            if error is None:
+                continue
+            error = float(error)
+            self.best_orientation_error_rad = min(
+                self.best_orientation_error_rad, error
+            )
+            self.reached_error_60deg = bool(
+                self.reached_error_60deg or error <= np.deg2rad(60.0)
+            )
+            self.reached_error_45deg = bool(
+                self.reached_error_45deg or error <= np.deg2rad(45.0)
+            )
+            self.reached_error_30deg = bool(
+                self.reached_error_30deg or error <= np.deg2rad(30.0)
+            )
+            if not self.reached_success_tolerance and (
+                error <= self.success_tolerance_rad
+            ):
+                self.reached_success_tolerance = True
+                cube_pos = info.get("cube_pos")
+                if cube_pos is not None:
+                    self.success_tolerance_cube_height_m = float(cube_pos[2])
+                linear_speed = info.get("cube_linear_speed")
+                if linear_speed is not None:
+                    self.success_tolerance_linear_speed = float(linear_speed)
+                angular_speed = info.get("cube_angular_speed")
+                if angular_speed is not None:
+                    self.success_tolerance_angular_speed = float(angular_speed)
+                contact_count = info.get("cube_hand_contact_count")
+                if contact_count is not None:
+                    self.success_tolerance_hand_contact_count = int(
+                        contact_count
+                    )
+        self.max_stable_success_steps = max(
+            self.max_stable_success_steps,
+            int(info.get("stable_success_steps", 0)),
+        )
+        if info.get("target_completed"):
+            self.max_stable_success_steps = max(
+                self.max_stable_success_steps,
+                int(info.get("success_hold_steps", 0)),
+            )
+        if self.drop_step is None and info.get("dropped"):
+            self.drop_step = int(episode_step)
+
+    def metrics(self) -> dict:
+        return asdict(self)
+
+
+def _episode_funnel(reset_info: dict, env) -> _EpisodeFunnel:
+    tolerance = reset_info.get("success_tolerance_rad")
+    if tolerance is None:
+        tolerance = getattr(env, "success_tolerance_rad", 0.4)
+    funnel = _EpisodeFunnel(float(tolerance))
+    funnel.observe(reset_info, episode_step=0)
+    return funnel
+
+
+def _mean_present(metrics: list[dict], field: str) -> float | None:
+    values = [item[field] for item in metrics if item[field] is not None]
+    return float(np.mean(values)) if values else None
+
+
+def _wilson_interval(successes: int, trials: int) -> dict[str, float]:
+    if trials <= 0:
+        raise ValueError("trials must be positive")
+    z = 1.959963984540054
+    probability = successes / trials
+    denominator = 1.0 + z * z / trials
+    center = (probability + z * z / (2.0 * trials)) / denominator
+    margin = (
+        z
+        * np.sqrt(
+            probability * (1.0 - probability) / trials
+            + z * z / (4.0 * trials * trials)
+        )
+        / denominator
+    )
+    return {
+        "lower": float(max(0.0, center - margin)),
+        "upper": float(min(1.0, center + margin)),
+    }
 
 
 def resolve_preset(config: StateTrainConfig) -> StateTrainConfig:
@@ -116,6 +269,7 @@ def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
     completion_seconds = []
     final_errors = []
     best_errors = []
+    funnel_metrics = []
     bucket_stats: dict[str, dict[str, object]] = {}
 
     def record_attempt(angle_rad: float | None) -> None:
@@ -131,21 +285,21 @@ def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
 
     for episode in range(episodes):
         observation, reset_info = env.reset(seed=seed + episode)
+        funnel = _episode_funnel(reset_info, env)
         record_attempt(reset_info.get("target_rotation_angle_rad"))
-        initial_error = float(reset_info["orientation_error_rad"])
-        best_error = initial_error
         episode_return = 0.0
         success = False
         dropped = False
         done = False
         info = reset_info
+        episode_steps = 0
 
         while not done:
             action = agent.act(observation, step=0, eval_mode=True)
             observation, reward, terminated, truncated, info = env.step(action)
+            episode_steps += 1
+            funnel.observe(info, episode_step=episode_steps)
             episode_return += float(reward)
-            current_error = float(info["orientation_error_rad"])
-            best_error = min(best_error, current_error)
             success = success or bool(info.get("is_success", False))
             dropped = dropped or bool(info.get("dropped", False))
             done = terminated or truncated
@@ -180,7 +334,8 @@ def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
         timeouts.append(info.get("termination_reason") == "task_timeout")
         targets_completed.append(int(info.get("tasks_completed", int(success))))
         final_errors.append(float(info["orientation_error_rad"]))
-        best_errors.append(best_error)
+        best_errors.append(funnel.best_orientation_error_rad)
+        funnel_metrics.append(funnel.metrics())
 
     rotation_buckets = {}
     for bucket in ("90", "120", "180"):
@@ -197,9 +352,47 @@ def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
             "mean_completion_s": float(np.mean(seconds)) if seconds else 0.0,
         }
 
+    funnel = {
+        "reached_error_60deg_rate": float(
+            np.mean([item["reached_error_60deg"] for item in funnel_metrics])
+        ),
+        "reached_error_45deg_rate": float(
+            np.mean([item["reached_error_45deg"] for item in funnel_metrics])
+        ),
+        "reached_error_30deg_rate": float(
+            np.mean([item["reached_error_30deg"] for item in funnel_metrics])
+        ),
+        "reached_success_tolerance_rate": float(
+            np.mean(
+                [item["reached_success_tolerance"] for item in funnel_metrics]
+            )
+        ),
+        "mean_max_stable_success_steps": float(
+            np.mean(
+                [item["max_stable_success_steps"] for item in funnel_metrics]
+            )
+        ),
+        "mean_drop_step": _mean_present(funnel_metrics, "drop_step"),
+        "mean_success_tolerance_cube_height_m": _mean_present(
+            funnel_metrics, "success_tolerance_cube_height_m"
+        ),
+        "mean_success_tolerance_linear_speed": _mean_present(
+            funnel_metrics, "success_tolerance_linear_speed"
+        ),
+        "mean_success_tolerance_angular_speed": _mean_present(
+            funnel_metrics, "success_tolerance_angular_speed"
+        ),
+        "mean_success_tolerance_hand_contact_count": _mean_present(
+            funnel_metrics, "success_tolerance_hand_contact_count"
+        ),
+    }
+
     return {
         "return": float(np.mean(returns)),
         "success_rate": float(np.mean(successes)),
+        "success_rate_ci95": _wilson_interval(
+            int(np.sum(successes)), len(successes)
+        ),
         "mean_targets_completed": float(np.mean(targets_completed)),
         "median_targets_completed": float(np.median(targets_completed)),
         "total_targets_completed": int(np.sum(targets_completed)),
@@ -213,6 +406,7 @@ def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
         ),
         "mean_final_orientation_error_rad": float(np.mean(final_errors)),
         "mean_best_orientation_error_rad": float(np.mean(best_errors)),
+        "funnel": funnel,
         "rotation_buckets": rotation_buckets,
     }
 
@@ -240,6 +434,7 @@ def train_state(
         task_values = {
             "target_policy": config.target_policy,
             "target_sequence_length": config.target_sequence_length,
+            "target_rotation_angle_rad": config.target_rotation_angle_rad,
             "success_tolerance_rad": config.success_tolerance_rad,
             "control_period_s": config.control_period_s,
             "max_task_duration_s": config.max_task_duration_s,
@@ -260,6 +455,7 @@ def train_state(
                 goal_mode="cube_orientation",
                 target_policy=config.target_policy,
                 target_sequence_length=config.target_sequence_length,
+                target_rotation_angle_rad=config.target_rotation_angle_rad,
                 success_tolerance_rad=config.success_tolerance_rad,
                 control_period_s=config.control_period_s,
                 max_task_duration_s=config.max_task_duration_s,
@@ -273,11 +469,15 @@ def train_state(
                 progress_reward_scale=config.progress_reward_scale,
                 success_bonus=config.success_bonus,
                 step_penalty=config.step_penalty,
+                gate_orientation_progress_on_grasp=(
+                    config.gate_orientation_progress_on_grasp
+                ),
+                grasp_height_reward_scale=config.grasp_height_reward_scale,
             )
 
     env = env_factory()
     eval_env = env_factory()
-    observation, _ = env.reset(seed=config.seed)
+    observation, reset_info = env.reset(seed=config.seed)
     state_dim = int(observation["state"].size)
     action_dim = int(env.action_space.shape[0])
     device = select_device(config.device)
@@ -288,6 +488,8 @@ def train_state(
         StateAgentConfig(
             hidden_dim=config.hidden_dim,
             batch_size=config.batch_size,
+            stddev_schedule=config.behavior_stddev_schedule,
+            stddev_clip=config.behavior_stddev_clip,
         ),
     )
     replay = StateReplayBuffer(
@@ -297,13 +499,16 @@ def train_state(
     start_step = agent.load(config.resume) if config.resume else 0
     episode_return = 0.0
     episode_length = 0
+    episode_funnel = _episode_funnel(reset_info, env)
 
     try:
         for step in range(start_step + 1, config.total_steps + 1):
             if step <= config.seed_steps:
-                action = rng.uniform(-1.0, 1.0, size=action_dim).astype(
-                    np.float32
-                )
+                action = rng.uniform(
+                    -config.seed_action_scale,
+                    config.seed_action_scale,
+                    size=action_dim,
+                ).astype(np.float32)
             else:
                 action = agent.act(observation, step)
             next_observation, reward, terminated, truncated, info = env.step(
@@ -328,6 +533,7 @@ def train_state(
             observation = next_observation
             episode_return += float(reward)
             episode_length += 1
+            episode_funnel.observe(info, episode_step=episode_length)
 
             if step > config.seed_steps and len(replay) >= config.batch_size:
                 update_metrics = agent.update(replay, step)
@@ -352,11 +558,13 @@ def train_state(
                         "final_orientation_error_rad": info.get(
                             "orientation_error_rad"
                         ),
+                        **episode_funnel.metrics(),
                     },
                 )
-                observation, _ = env.reset()
+                observation, reset_info = env.reset()
                 episode_return = 0.0
                 episode_length = 0
+                episode_funnel = _episode_funnel(reset_info, env)
 
             if config.eval_every_steps and step % config.eval_every_steps == 0:
                 result = evaluate_state(
@@ -386,13 +594,26 @@ def parse_args(argv: list[str] | None = None) -> StateTrainConfig:
     )
     parser.add_argument(
         "--preset",
-        choices=("single_goal", "right_angle", "multi_goal"),
+        choices=(
+            "turn_30",
+            "turn_45",
+            "turn_60",
+            "single_goal",
+            "right_angle",
+            "multi_goal",
+        ),
         default="single_goal",
     )
     parser.add_argument("--total-steps", type=int, default=1_000_000)
     parser.add_argument("--seed-steps", type=int, default=5_000)
+    parser.add_argument("--seed-action-scale", type=float, default=0.1)
+    parser.add_argument(
+        "--behavior-stddev-schedule",
+        default="linear(0.2,0.05,100000)",
+    )
+    parser.add_argument("--behavior-stddev-clip", type=float, default=0.2)
     parser.add_argument("--eval-every-steps", type=int, default=10_000)
-    parser.add_argument("--eval-episodes", type=int, default=20)
+    parser.add_argument("--eval-episodes", type=int, default=100)
     parser.add_argument("--eval-seed", type=int, default=10_000)
     parser.add_argument("--checkpoint-every-steps", type=int, default=50_000)
     parser.add_argument("--replay-capacity", type=int, default=200_000)
@@ -421,6 +642,14 @@ def parse_args(argv: list[str] | None = None) -> StateTrainConfig:
     parser.add_argument("--success-bonus", type=float, default=10.0)
     parser.add_argument("--step-penalty", type=float, default=0.01)
     parser.add_argument(
+        "--gate-orientation-progress-on-grasp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--grasp-height-reward-scale", type=float, default=0.01
+    )
+    parser.add_argument(
         "--target-policy",
         choices=(
             "fixed_quarter_turn",
@@ -429,6 +658,9 @@ def parse_args(argv: list[str] | None = None) -> StateTrainConfig:
         ),
     )
     parser.add_argument("--target-sequence-length", type=int)
+    target_angle = parser.add_mutually_exclusive_group()
+    target_angle.add_argument("--target-rotation-angle-rad", type=float)
+    target_angle.add_argument("--target-rotation-degrees", type=float)
     tolerance = parser.add_mutually_exclusive_group()
     tolerance.add_argument("--success-tolerance-rad", type=float)
     tolerance.add_argument("--success-tolerance-degrees", type=float)
@@ -440,6 +672,11 @@ def parse_args(argv: list[str] | None = None) -> StateTrainConfig:
         choices=("absolute", "progress", "angular_progress"),
     )
     values = vars(parser.parse_args(argv))
+    target_degrees = values.pop("target_rotation_degrees")
+    if target_degrees is not None:
+        values["target_rotation_angle_rad"] = float(
+            np.deg2rad(target_degrees)
+        )
     degrees = values.pop("success_tolerance_degrees")
     if degrees is not None:
         values["success_tolerance_rad"] = float(np.deg2rad(degrees))

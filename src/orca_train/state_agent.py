@@ -23,10 +23,20 @@ class StateAgentConfig:
     hidden_dim: int = 1024
     learning_rate: float = 1e-4
     critic_target_tau: float = 0.01
-    stddev_schedule: str = "linear(1.0,0.1,500000)"
-    stddev_clip: float = 0.3
+    stddev_schedule: str = "linear(0.2,0.05,100000)"
+    stddev_clip: float = 0.2
     batch_size: int = 256
     update_every_steps: int = 2
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.stddev_clip) or self.stddev_clip < 0.0:
+            raise ValueError("stddev_clip must be finite and non-negative")
+        try:
+            schedule(self.stddev_schedule, step=0)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Invalid stddev_schedule: {self.stddev_schedule!r}"
+            ) from error
 
 
 class StateAgent:
@@ -73,7 +83,9 @@ class StateAgent:
         action = self.actor(state)
         if not eval_mode:
             stddev = schedule(self.config.stddev_schedule, step)
-            action = action + torch.randn_like(action) * stddev
+            action = sample_noisy_action(
+                action, stddev, self.config.stddev_clip
+            )
         return action.clamp(-1.0, 1.0).squeeze(0).cpu().numpy()
 
     def update(self, replay: StateReplayBuffer, step: int) -> dict[str, float]:
