@@ -74,12 +74,34 @@ The static curricula are:
 
 Each preset uses angular-error progress reward. Training does not advance between
 presets automatically; start a new run explicitly after evaluating the previous
-stage. Reset holds the initial controller targets for 1 second before drawing a
-goal from the settled cube orientation. The initial XY position is independently
+stage. The default `--initial-grasp thumb_opposed_v1` starts from an open hand,
+ramps the controller targets over 0.5 seconds to establish thumb–finger contact,
+then holds them for 1 second before drawing a goal from the settled cube
+orientation. Preparation does not consume policy steps or the task time budget.
+The final load-bearing controller targets are retained for subsequent actions.
+The cube starts at `(0.17, -0.015, 0.2015)` meters, above the unclosed fingers.
+The initial XY position is independently
 jittered by up to 1 mm per axis, using the reset seed. The fixed turns and the
 orientation bag use this settled reference; random turns use the current pose.
 `--reset-settle-duration-s`, `--cube-pos-xy-jitter`, and
 `--no-target-relative-to-reset` allow controlled comparisons.
+
+The grasp's position-controller targets are in degrees:
+
+| Finger | CMC | ABD | MCP | PIP |
+|---|---:|---:|---:|---:|
+| Thumb | -14 | 2 | 56 | 65 |
+| Index | — | 0 | 36 | 30 |
+| Middle | — | 0 | 47 | 47 |
+| Ring | — | 0 | 1 | -2 |
+| Pinky | — | 0 | 0 | 0 |
+
+The wrist stays at zero. These targets are applied through simulated closure,
+not assigned directly as joint positions. `--initial-grasp scene` restores the
+previous scene pose and cube height, with the existing one-second settling phase.
+The visual trainer and the simulator's own default reset are unchanged. The new
+state default requires an `orca_sim` version supporting
+`reset_control_targets_by_joint` and `initial_cube_pos`.
 
 ## Install
 
@@ -163,8 +185,10 @@ penalty region. Evaluation reports raw `task_return` separately from `return`,
 which includes this control penalty. Value calibration uses the latter objective.
 
 Use a fresh critic when changing this reward term. Resuming a trainer run checks
-its adjacent `config.json` and rejects a changed limit-penalty scale; manifests
-from before this feature imply scale zero. Standalone agent checkpoints without
+its adjacent `config.json` and rejects a changed limit-penalty scale or initial
+grasp. Older manifests imply scale zero and the `scene` grasp. To transfer an
+actor to the new grasp, use `--warm-start` to start with fresh critics; to resume
+an old run fully, explicitly select its original grasp. Standalone agent checkpoints without
 a trainer manifest do not contain environment reward metadata, so their caller
 must supply the matching environment configuration.
 

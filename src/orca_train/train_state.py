@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from .agent import schedule
+from .initial_grasps import INITIAL_GRASP_NAMES, initial_grasp_kwargs
 from .replay import NStepAccumulator, StateReplayBuffer
 from .state_agent import StateAgent, StateAgentConfig
 from .state_env import OrcaStateCubeEnv
@@ -43,6 +44,7 @@ class StateTrainConfig:
     warm_start: Path | None = None
     max_delta_degrees: float = 3.0
     joint_limit_penalty_scale: float = 0.1
+    initial_grasp: str = "thumb_opposed_v1"
     hidden_dim: int = 1024
     fix_wrist: bool = True
     joint_velocity_limit: float = 10.0
@@ -73,6 +75,8 @@ class StateTrainConfig:
     reward_mode: str | None = None
 
     def __post_init__(self) -> None:
+        if self.initial_grasp not in INITIAL_GRASP_NAMES:
+            raise ValueError(f"Unknown initial_grasp: {self.initial_grasp!r}")
         alpha = self.behavior_regularization_alpha
         if alpha is not None and (not np.isfinite(alpha) or alpha < 0):
             raise ValueError("behavior_regularization_alpha must be finite and non-negative")
@@ -510,6 +514,7 @@ def make_state_env(config: StateTrainConfig) -> OrcaStateCubeEnv:
         reset_settle_duration_s=config.reset_settle_duration_s,
         cube_pos_xy_jitter=config.cube_pos_xy_jitter,
         target_relative_to_reset=config.target_relative_to_reset,
+        **initial_grasp_kwargs(config.initial_grasp),
     )
 
 
@@ -537,6 +542,10 @@ def train_state(
                 raise ValueError(
                     "resume changes joint_limit_penalty_scale; use warm_start "
                     "or keep the previous reward configuration"
+                )
+            if previous.get("initial_grasp", "scene") != config.initial_grasp:
+                raise ValueError(
+                    "resume changes initial_grasp; use warm_start or keep the previous grasp"
                 )
     random.seed(config.seed)
     np.random.seed(config.seed)
@@ -729,6 +738,7 @@ def parse_args(argv: list[str] | None = None) -> StateTrainConfig:
     initialization.add_argument("--warm-start", type=Path)
     parser.add_argument("--max-delta-degrees", type=float, default=3.0)
     parser.add_argument("--joint-limit-penalty-scale", type=float, default=0.1)
+    parser.add_argument("--initial-grasp", choices=INITIAL_GRASP_NAMES, default="thumb_opposed_v1")
     parser.add_argument("--hidden-dim", type=int, default=1024)
     parser.add_argument("--fix-wrist", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--joint-velocity-limit", type=float, default=10.0)
