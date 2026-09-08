@@ -349,8 +349,24 @@ def test_resume_cannot_silently_change_previous_run_limit_penalty(tmp_path):
         resume=checkpoint, total_steps=4, hidden_dim=32, seed_steps=0,
         batch_size=2, replay_capacity=10, eval_every_steps=0,
         joint_limit_penalty_scale=0.0, output_dir=tmp_path / "matching_resume",
+        initial_grasp="scene",
     ), env_factory=_TinyStateEnv)
     assert (tmp_path / "matching_resume" / "checkpoint_4.pt").exists()
+
+
+def test_resume_cannot_silently_change_initial_grasp(tmp_path):
+    previous = tmp_path / "previous"
+    previous.mkdir()
+    checkpoint = previous / "checkpoint_2.pt"
+    StateAgent(47, 16, "cpu", StateAgentConfig(hidden_dim=32)).save(checkpoint, 2)
+    (previous / "config.json").write_text(json.dumps({"joint_limit_penalty_scale": 0.1}))
+    output = tmp_path / "resumed"
+    with pytest.raises(ValueError, match="initial_grasp"):
+        train_state(StateTrainConfig(
+            resume=checkpoint, total_steps=4, hidden_dim=32,
+            output_dir=output, eval_every_steps=0,
+        ), env_factory=_TinyStateEnv)
+    assert not output.exists()
 
 
 class _TinyStateEnv:
