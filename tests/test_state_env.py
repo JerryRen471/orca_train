@@ -36,6 +36,7 @@ class _FakeStateCubeEnv(gym.Env):
             ),
         )
         self.data = SimpleNamespace(
+            ctrl=np.linspace(-0.25, 0.25, 17),
             qpos=np.linspace(-0.25, 0.25, 17),
             qvel=np.linspace(-10.0, 10.0, 17),
             xpos=np.array([self.MOUNT_POS, np.zeros(3)]),
@@ -63,6 +64,7 @@ class _FakeStateCubeEnv(gym.Env):
 
     def reset(self, *, seed=None, options=None):
         self.data.qpos[:] = np.linspace(-0.25, 0.25, 17)
+        self.data.ctrl[:] = self.data.qpos
         self.data.qvel[:] = np.linspace(-10.0, 10.0, 17)
         return np.zeros(58), self._info()
 
@@ -88,7 +90,7 @@ def test_state_observation_has_documented_order_scaling_and_bounds() -> None:
     observation, _ = env.reset(seed=7)
     state = observation["state"]
 
-    assert state.shape == (47,)
+    assert state.shape == (64,)
     assert state.dtype == np.float32
     assert env.observation_space.contains(observation)
     np.testing.assert_allclose(state[0:17], np.linspace(-0.5, 0.5, 17))
@@ -97,9 +99,10 @@ def test_state_observation_has_documented_order_scaling_and_bounds() -> None:
     np.testing.assert_allclose(state[37:40], [0.5, -1.0, 0.25])
     np.testing.assert_allclose(state[40:43], [0.5, -1.0, 0.25])
     np.testing.assert_allclose(state[43:47], _FakeStateCubeEnv.RELATIVE_TARGET_QUAT)
+    np.testing.assert_allclose(state[47:64], np.linspace(-0.5, 0.5, 17))
 
 
-def test_state_actions_are_measured_deltas_and_can_lock_wrist() -> None:
+def test_state_targets_accumulate_despite_load_deflection_and_hold_wrist() -> None:
     base = _FakeStateCubeEnv()
     env = OrcaStateCubeEnv(
         env=base,
@@ -124,8 +127,31 @@ def test_state_actions_are_measured_deltas_and_can_lock_wrist() -> None:
     base.data.qpos[:] = measured
     env.step(np.ones(16, dtype=np.float32))
     expected = np.clip(
-        measured[1:] + np.deg2rad(3.0),
+        np.linspace(-0.25, 0.25, 17)[1:] + np.deg2rad(6.0),
         base.action_space.low[1:],
         base.action_space.high[1:],
     )
     np.testing.assert_allclose(base.last_action[1:], expected, atol=1e-7)
+
+    previous_target = base.last_action.copy()
+    base.data.qpos[:] = measured
+    observation, *_ = env.step(np.zeros(16, dtype=np.float32))
+    np.testing.assert_array_equal(base.last_action, previous_target)
+    np.testing.assert_allclose(observation["state"][47:], 2 * previous_target)
+
+
+def test_zero_action_retains_support_for_eight_seconds_in_real_mujoco() -> None:
+    env = OrcaStateCubeEnv(
+        version="v2", control_period_s=0.08, goal_mode="cube_orientation",
+        target_policy="fixed_quarter_turn", target_rotation_angle_rad=np.pi / 3,
+        target_sequence_length=1, max_task_duration_s=8.0,
+    )
+    try:
+        env.reset(seed=1)
+        for _ in range(100):
+            _, _, _, _, info = env.step(np.zeros(17, dtype=np.float32))
+            assert not info["dropped"]
+        assert info["cube_pos"][2] > 0.12
+        assert info["cube_hand_contact_count"] > 0
+    finally:
+        env.close()
