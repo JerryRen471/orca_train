@@ -76,6 +76,13 @@ def test_state_training_rejects_invalid_behavior_noise_schedule() -> None:
         StateTrainConfig(behavior_stddev_schedule="linear(0.2,0.05,0)")
 
 
+def test_behavior_regularization_can_be_configured_and_disabled_from_cli():
+    assert parse_args(["--behavior-regularization-alpha", "0.2"]).behavior_regularization_alpha == 0.2
+    assert parse_args(["--no-behavior-regularization"]).behavior_regularization_alpha is None
+    with pytest.raises(ValueError, match="behavior_regularization_alpha"):
+        StateTrainConfig(behavior_regularization_alpha=-0.1)
+
+
 def test_state_curriculum_derives_distinct_default_run_directories() -> None:
     resolved = {
         preset: resolve_preset(StateTrainConfig(preset=preset, seed=7)).output_dir
@@ -288,6 +295,62 @@ def test_state_evaluation_reports_orientation_and_rotation_bucket_metrics() -> N
             "mean_completion_s": pytest.approx(0.32),
         },
     }
+
+
+@pytest.mark.parametrize("truncated", [False, True])
+def test_evaluation_calibrates_value_only_on_terminal_returns(truncated):
+    class KnownAgent:
+        def act(self, observation, step, eval_mode=False):
+            return np.tile([1.0, 0.0], 8)
+
+        def value(self, observation):
+            return 5.0
+
+    class KnownEnv(_EvaluationStateEnv):
+        def step(self, action):
+            obs, reward, terminal, _, info = super().step(action)
+            info["joint_target_limit_fraction"] = 0.25 if self.steps == 1 else 0.75
+            info["task_reward"] = 2.0
+            info["joint_limit_penalty"] = 1.0
+            return obs, reward, terminal and not truncated, terminal and truncated, info
+
+    result = evaluate_state(KnownAgent(), KnownEnv(), episodes=1, seed=100, gamma=0.5)
+    assert result["mean_initial_q"] == 5.0
+    assert result["mean_discounted_return"] == 1.5
+    assert result["value_calibration_episodes"] == (0 if truncated else 1)
+    assert result["mean_value_bias_terminal"] == (None if truncated else 3.5)
+    assert result["action_rms"] == pytest.approx(np.sqrt(0.5))
+    assert result["action_saturation_fraction"] == 0.5
+    assert result["mean_joint_target_limit_fraction"] == 0.5
+    assert result["task_return"] == 4.0
+    assert result["mean_joint_limit_penalty"] == 1.0
+
+
+def test_limit_penalty_cli_and_validation():
+    assert parse_args(["--joint-limit-penalty-scale", "0"]).joint_limit_penalty_scale == 0
+    with pytest.raises(ValueError, match="joint_limit_penalty_scale"):
+        StateTrainConfig(joint_limit_penalty_scale=-0.1)
+
+
+def test_resume_cannot_silently_change_previous_run_limit_penalty(tmp_path):
+    previous = tmp_path / "previous"
+    previous.mkdir()
+    checkpoint = previous / "checkpoint_2.pt"
+    StateAgent(47, 16, "cpu", StateAgentConfig(hidden_dim=32)).save(checkpoint, 2)
+    # Older run manifests predate the penalty and therefore mean scale zero.
+    (previous / "config.json").write_text(json.dumps({"preset": "turn_30"}))
+    with pytest.raises(ValueError, match="joint_limit_penalty_scale"):
+        train_state(StateTrainConfig(
+            resume=checkpoint, total_steps=4, hidden_dim=32,
+            output_dir=tmp_path / "bad_resume", eval_every_steps=0,
+        ), env_factory=_TinyStateEnv)
+    assert not (tmp_path / "bad_resume" / "config.json").exists()
+    train_state(StateTrainConfig(
+        resume=checkpoint, total_steps=4, hidden_dim=32, seed_steps=0,
+        batch_size=2, replay_capacity=10, eval_every_steps=0,
+        joint_limit_penalty_scale=0.0, output_dir=tmp_path / "matching_resume",
+    ), env_factory=_TinyStateEnv)
+    assert (tmp_path / "matching_resume" / "checkpoint_4.pt").exists()
 
 
 class _TinyStateEnv:

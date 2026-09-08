@@ -2,8 +2,42 @@ from types import SimpleNamespace
 
 import gymnasium as gym
 import numpy as np
+import pytest
 
 from orca_train.state_env import OrcaStateCubeEnv
+
+
+def test_control_diagnostics_exclude_fixed_wrist_and_measure_active_limits():
+    env = OrcaStateCubeEnv(env=_FakeStateCubeEnv(), fixed_joint_names=("right_wrist",))
+    env.reset()
+    env._target[:] = 0
+    env._target[:2] = 0.5
+    _, reward, _, _, info = env.step(np.zeros(16))
+    assert reward == 0.75
+    assert info["joint_target_limit_fraction"] == pytest.approx(1 / 16)
+    assert info["joint_position_limit_fraction"] == pytest.approx(1 / 16)
+    assert info["controller_tracking_error_rms_deg"] == 0
+
+
+@pytest.mark.parametrize("target, expected_penalty", [(0.0, 0.0), (0.475, 0.025), (0.5, 0.1), (-0.5, 0.1)])
+def test_soft_limit_penalty_preserves_rom_and_excludes_fixed_wrist(target, expected_penalty):
+    base = _FakeStateCubeEnv()
+    env = OrcaStateCubeEnv(env=base, fixed_joint_names=("right_wrist",), joint_limit_penalty_scale=0.1)
+    env.reset()
+    env._target[:] = 0
+    env._target[0] = 0.5
+    env._target[1] = target
+    _, reward, _, _, info = env.step(np.zeros(16))
+    assert reward == pytest.approx(0.75 - expected_penalty)
+    assert info["joint_limit_penalty"] == pytest.approx(expected_penalty, abs=1e-7)
+    assert info["task_reward"] == 0.75
+    assert base.last_action[1] == pytest.approx(target)
+
+
+@pytest.mark.parametrize("scale", [-0.1, np.nan, np.inf])
+def test_soft_limit_penalty_rejects_invalid_scale(scale):
+    with pytest.raises(ValueError, match="joint_limit_penalty_scale"):
+        OrcaStateCubeEnv(env=_FakeStateCubeEnv(), joint_limit_penalty_scale=scale)
 
 
 class _FakeStateCubeEnv(gym.Env):

@@ -18,6 +18,31 @@ checkpoint formats.
 
 ## State baseline
 
+The state agent uses TD3 updates: a frozen target actor generates bootstrap
+actions, two critic updates precede each actor update, and both target networks
+track their online networks only after an actor update. Target-policy smoothing
+uses fixed noise (standard deviation 0.2, clip 0.5), independently of the behavior
+exploration schedule. The actor optimizes deterministic Q1. Network width,
+learning rate, replay, n-step returns and the environment control period retain
+the state baseline settings.
+
+The default policy update also penalizes deviation from the actions sampled from
+replay. Its loss is `-alpha * mean(Q1) / max(mean(abs(Q1)), 1) + MSE(policy, replay)`;
+the Q denominator is detached from gradients. This TD3+BC-inspired constraint
+limits exploitation of actions with little replay support. The denominator floor
+avoids amplifying a nearly zero early critic. `--behavior-regularization-alpha`
+defaults to 0.1; `--no-behavior-regularization` recovers the unregularized TD3
+objective for comparisons. This online adaptation is evaluated separately from
+the original offline TD3+BC algorithm.
+
+Checkpoints identify the regularized algorithm as `state_td3_bc_v1` and save both
+target networks and the critic-update counter. Unregularized runs use
+`state_td3_v1`. Full resume requires the same algorithm and regularization alpha;
+a dimension-compatible actor can still be transferred with `--warm-start`, which
+synchronizes its target actor and starts fresh critics. Earlier 64-value state
+checkpoints support actor transfer but cannot restore their old critic/optimizers
+into the new algorithm.
+
 The state trainer uses a bounded 64-value observation in this order:
 
 1. 17 actuator positions normalized by joint ROM.
@@ -127,6 +152,30 @@ the confidence interval if any initial states repeat. Each run also evaluates a
 zero-action controller on the same seeds and logs success-rate gain over that
 baseline. A course must outperform zero action and meet the full hold requirement
 before promotion; a high angle-only funnel rate is insufficient.
+
+To discourage cumulative targets sticking at joint limits, state training adds
+a smooth penalty inside the outer 5% of each active joint's ROM. For normalized
+distance `d` to the nearest limit, the per-joint cost is
+`joint_limit_penalty_scale * clip(1 - d / 0.05, 0, 1)^2`, summed over active joints.
+The scale defaults to 0.1; `--joint-limit-penalty-scale 0` disables it. Full ROM and
+action ranges remain available, and the default reset targets lie outside the
+penalty region. Evaluation reports raw `task_return` separately from `return`,
+which includes this control penalty. Value calibration uses the latter objective.
+
+Use a fresh critic when changing this reward term. Resuming a trainer run checks
+its adjacent `config.json` and rejects a changed limit-penalty scale; manifests
+from before this feature imply scale zero. Standalone agent checkpoints without
+a trainer manifest do not contain environment reward metadata, so their caller
+must supply the matching environment configuration.
+
+Evaluation also reports action RMS, the fraction of action components above 0.95
+in magnitude, and the fraction of active joint targets/positions within 1% of
+either ROM limit. The fixed wrist is excluded. `mean_value_bias_terminal`
+compares the initial twin-critic minimum with the realized discounted return,
+using only episodes that terminate. Externally truncated episodes are excluded
+because their future return is unobserved; `value_calibration_episodes` records
+the comparison count. These diagnostics measure value error and aggressive
+control directly rather than inferring them from success rate alone.
 
 The default exploration policy uses `linear(0.2,0.05,100000)` Gaussian noise
 clipped to `0.2`; the replay warm-up samples only within `±0.1`. Angular progress

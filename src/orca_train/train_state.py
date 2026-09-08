@@ -27,6 +27,7 @@ class StateTrainConfig:
     seed_action_scale: float = 0.1
     behavior_stddev_schedule: str = "linear(0.2,0.05,100000)"
     behavior_stddev_clip: float = 0.2
+    behavior_regularization_alpha: float | None = 0.1
     eval_every_steps: int = 10_000
     eval_episodes: int = 100
     eval_seed: int = 10_000
@@ -41,6 +42,7 @@ class StateTrainConfig:
     resume: Path | None = None
     warm_start: Path | None = None
     max_delta_degrees: float = 3.0
+    joint_limit_penalty_scale: float = 0.1
     hidden_dim: int = 1024
     fix_wrist: bool = True
     joint_velocity_limit: float = 10.0
@@ -71,9 +73,12 @@ class StateTrainConfig:
     reward_mode: str | None = None
 
     def __post_init__(self) -> None:
+        alpha = self.behavior_regularization_alpha
+        if alpha is not None and (not np.isfinite(alpha) or alpha < 0):
+            raise ValueError("behavior_regularization_alpha must be finite and non-negative")
         if self.resume is not None and self.warm_start is not None:
             raise ValueError("resume and warm_start are mutually exclusive")
-        for name in ("stable_hold_reward_scale", "reset_settle_duration_s", "cube_pos_xy_jitter"):
+        for name in ("stable_hold_reward_scale", "reset_settle_duration_s", "cube_pos_xy_jitter", "joint_limit_penalty_scale"):
             value = getattr(self, name)
             if not np.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
@@ -273,12 +278,15 @@ def _rotation_bucket(angle_rad: float) -> str | None:
     return None
 
 
-def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
+def evaluate_state(agent, env, episodes: int, seed: int, gamma: float = 0.99) -> dict:
     if episodes <= 0:
         raise ValueError("episodes must be positive")
+    if not np.isfinite(gamma) or not 0 <= gamma <= 1:
+        raise ValueError("gamma must be finite and within [0, 1]")
     initial_states = set()
     episode_lengths = []
     returns = []
+    task_returns = []
     successes = []
     drops = []
     timeouts = []
@@ -288,6 +296,13 @@ def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
     best_errors = []
     funnel_metrics = []
     bucket_stats: dict[str, dict[str, object]] = {}
+    initial_values, discounted_returns, value_biases = [], [], []
+    action_squared_sum, saturated_actions, action_count = 0.0, 0, 0
+    control_metrics = {name: [] for name in (
+        "joint_target_limit_fraction", "joint_position_limit_fraction",
+        "controller_tracking_error_rms_deg",
+        "joint_limit_penalty",
+    )}
 
     def record_attempt(angle_rad: float | None) -> None:
         if angle_rad is None:
@@ -308,18 +323,31 @@ def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
         funnel = _episode_funnel(reset_info, env)
         record_attempt(reset_info.get("target_rotation_angle_rad"))
         episode_return = 0.0
+        task_return = 0.0
         success = False
         dropped = False
         done = False
         info = reset_info
         episode_steps = 0
+        discounted_return = 0.0
+        initial_value = agent.value(observation) if hasattr(agent, "value") else None
+        if initial_value is not None:
+            initial_values.append(initial_value)
 
         while not done:
             action = agent.act(observation, step=0, eval_mode=True)
+            action_squared_sum += float(np.square(action).sum())
+            saturated_actions += int(np.sum(np.abs(action) > 0.95))
+            action_count += int(np.size(action))
             observation, reward, terminated, truncated, info = env.step(action)
+            discounted_return += gamma ** episode_steps * float(reward)
+            for name, values in control_metrics.items():
+                if name in info:
+                    values.append(float(info[name]))
             episode_steps += 1
             funnel.observe(info, episode_step=episode_steps)
             episode_return += float(reward)
+            task_return += float(info.get("task_reward", reward))
             success = success or bool(info.get("is_success", False))
             dropped = dropped or bool(info.get("dropped", False))
             done = terminated or truncated
@@ -349,6 +377,10 @@ def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
                     record_attempt(info.get("target_rotation_angle_rad"))
 
         returns.append(episode_return)
+        task_returns.append(task_return)
+        discounted_returns.append(discounted_return)
+        if terminated and initial_value is not None:
+            value_biases.append(initial_value - discounted_return)
         episode_lengths.append(episode_steps)
         successes.append(success)
         drops.append(dropped)
@@ -409,10 +441,19 @@ def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
     }
 
     return {
+        "mean_initial_q": float(np.mean(initial_values)) if initial_values else None,
+        "mean_discounted_return": float(np.mean(discounted_returns)),
+        "mean_value_bias_terminal": float(np.mean(value_biases)) if value_biases else None,
+        "value_calibration_episodes": len(value_biases),
+        "action_rms": float(np.sqrt(action_squared_sum / action_count)),
+        "action_saturation_fraction": saturated_actions / action_count,
+        **{f"mean_{name}": float(np.mean(values)) if values else None
+           for name, values in control_metrics.items()},
         "episodes": episodes,
         "unique_initial_states": len(initial_states),
         "mean_episode_length": float(np.mean(episode_lengths)),
         "return": float(np.mean(returns)),
+        "task_return": float(np.mean(task_returns)),
         "success_rate": float(np.mean(successes)),
         "success_rate_ci95": (
             _wilson_interval(int(np.sum(successes)), len(successes))
@@ -440,6 +481,7 @@ def make_state_env(config: StateTrainConfig) -> OrcaStateCubeEnv:
     config = resolve_preset(config)
     return OrcaStateCubeEnv(
         max_delta_degrees=config.max_delta_degrees,
+        joint_limit_penalty_scale=config.joint_limit_penalty_scale,
         fixed_joint_names=("right_wrist",) if config.fix_wrist else (),
         joint_velocity_limit=config.joint_velocity_limit,
         workspace_radius=config.workspace_radius,
@@ -486,6 +528,16 @@ def train_state(
     config = resolve_preset(config)
     if config.output_dir is None:
         raise RuntimeError("Resolved state training output directory is missing")
+    if config.resume is not None:
+        manifest = config.resume.parent / "config.json"
+        if manifest.is_file():
+            previous = json.loads(manifest.read_text(encoding="utf-8"))
+            previous_penalty = previous.get("joint_limit_penalty_scale", 0.0)
+            if previous_penalty != config.joint_limit_penalty_scale:
+                raise ValueError(
+                    "resume changes joint_limit_penalty_scale; use warm_start "
+                    "or keep the previous reward configuration"
+                )
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
@@ -513,6 +565,7 @@ def train_state(
                 batch_size=config.batch_size,
                 stddev_schedule=config.behavior_stddev_schedule,
                 stddev_clip=config.behavior_stddev_clip,
+                behavior_regularization_alpha=config.behavior_regularization_alpha,
             ),
         )
         replay = StateReplayBuffer(
@@ -535,6 +588,7 @@ def train_state(
             zero_baseline = evaluate_state(
                 _ZeroActionAgent(action_dim), eval_env,
                 config.eval_episodes, config.eval_seed,
+                gamma=config.gamma,
             )
             event = {"type": "zero_action_evaluation", "step": start_step, **zero_baseline}
             write_metric(metrics_path, event)
@@ -606,7 +660,7 @@ def train_state(
 
             if config.eval_every_steps and step % config.eval_every_steps == 0:
                 result = evaluate_state(
-                    agent, eval_env, config.eval_episodes, config.eval_seed
+                    agent, eval_env, config.eval_episodes, config.eval_seed, gamma=config.gamma
                 )
                 event = {"type": "evaluation", "step": step, **result}
                 event["zero_action_success_rate"] = zero_baseline["success_rate"]
@@ -651,6 +705,12 @@ def parse_args(argv: list[str] | None = None) -> StateTrainConfig:
         default="linear(0.2,0.05,100000)",
     )
     parser.add_argument("--behavior-stddev-clip", type=float, default=0.2)
+    regularization = parser.add_mutually_exclusive_group()
+    regularization.add_argument("--behavior-regularization-alpha", type=float, default=0.1)
+    regularization.add_argument(
+        "--no-behavior-regularization", dest="behavior_regularization_alpha",
+        action="store_const", const=None,
+    )
     parser.add_argument("--eval-every-steps", type=int, default=10_000)
     parser.add_argument("--eval-episodes", type=int, default=100)
     parser.add_argument("--eval-seed", type=int, default=10_000)
@@ -668,6 +728,7 @@ def parse_args(argv: list[str] | None = None) -> StateTrainConfig:
     initialization.add_argument("--resume", type=Path)
     initialization.add_argument("--warm-start", type=Path)
     parser.add_argument("--max-delta-degrees", type=float, default=3.0)
+    parser.add_argument("--joint-limit-penalty-scale", type=float, default=0.1)
     parser.add_argument("--hidden-dim", type=int, default=1024)
     parser.add_argument("--fix-wrist", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--joint-velocity-limit", type=float, default=10.0)
