@@ -35,7 +35,10 @@ class OrcaStateCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             "linear_velocity_limit": linear_velocity_limit,
             "angular_velocity_limit": angular_velocity_limit,
         }
-        invalid = [name for name, value in scales.items() if value <= 0.0]
+        invalid = [
+            name for name, value in scales.items()
+            if not np.isfinite(value) or value <= 0.0
+        ]
         if invalid:
             raise ValueError(f"State environment scales must be positive: {invalid}")
 
@@ -94,7 +97,7 @@ class OrcaStateCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             dtype=np.float32,
         )
         self.observation_space = spaces.Dict(
-            {"state": spaces.Box(-1.0, 1.0, shape=(47,), dtype=np.float32)}
+            {"state": spaces.Box(-1.0, 1.0, shape=(64,), dtype=np.float32)}
         )
         self._target = np.zeros(17, dtype=np.float32)
 
@@ -154,6 +157,7 @@ class OrcaStateCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
                 linear_velocity_in_hand,
                 angular_velocity_in_hand,
                 relative_target,
+                2.0 * (self._target - self._joint_low) / joint_ranges - 1.0,
             ]
         )
         return {"state": np.clip(state, -1.0, 1.0).astype(np.float32)}
@@ -166,8 +170,8 @@ class OrcaStateCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
     ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
         _, info = self.env.reset(seed=seed, options=options)
         self._target = np.clip(
-            self._joint_angles(), self._joint_low, self._joint_high
-        )
+            self.env.data.ctrl, self._joint_low, self._joint_high
+        ).astype(np.float32).copy()
         return self._observation(info), info
 
     def step(
@@ -179,10 +183,11 @@ class OrcaStateCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
                 f"Expected normalized action shape {self.action_space.shape}, "
                 f"got {action.shape}"
             )
+        if not np.all(np.isfinite(action)):
+            raise ValueError("Action must contain only finite values")
         active = self._active_actuator_indices
-        measured = self._joint_angles()
         self._target[active] = np.clip(
-            measured[active]
+            self._target[active]
             + np.clip(action, -1.0, 1.0) * self.max_delta_radians,
             self._joint_low[active],
             self._joint_high[active],

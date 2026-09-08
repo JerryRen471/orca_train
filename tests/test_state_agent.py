@@ -6,6 +6,22 @@ from orca_train.replay import StateReplayBuffer
 from orca_train.state_agent import StateAgent, StateAgentConfig
 
 
+def test_actor_only_transfer_keeps_fresh_critic_and_rejects_old_observation(tmp_path) -> None:
+    source = StateAgent(64, 16, "cpu", StateAgentConfig(hidden_dim=32))
+    source.save(tmp_path / "parent.pt", 600000)
+    target = StateAgent(64, 16, "cpu", StateAgentConfig(hidden_dim=32))
+    critic_before = {key: value.clone() for key, value in target.critic.state_dict().items()}
+    assert target.load_actor(tmp_path / "parent.pt") == 600000
+    for key, value in target.actor.state_dict().items():
+        torch.testing.assert_close(value, source.actor.state_dict()[key])
+    for key, value in target.critic.state_dict().items():
+        torch.testing.assert_close(value, critic_before[key])
+    legacy = StateAgent(47, 16, "cpu", StateAgentConfig(hidden_dim=32))
+    legacy.save(tmp_path / "legacy.pt", 600000)
+    with pytest.raises(ValueError, match="state_dim"):
+        target.load_actor(tmp_path / "legacy.pt")
+
+
 def state_observation(value: float = 0.0) -> dict[str, np.ndarray]:
     return {"state": np.full(47, value, dtype=np.float32)}
 

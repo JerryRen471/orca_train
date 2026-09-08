@@ -13,6 +13,7 @@ from orca_train.train_state import (
     train_state,
 )
 from orca_train.state_agent import StateAgent, StateAgentConfig
+from orca_train import train_state as training
 
 
 @pytest.mark.parametrize(
@@ -49,7 +50,7 @@ def test_state_curriculum_presets_resolve_exact_task_settings(
     assert resolved.success_tolerance_rad == pytest.approx(tolerance_rad)
     assert resolved.control_period_s == pytest.approx(0.08)
     assert resolved.max_task_duration_s == pytest.approx(8.0)
-    assert resolved.success_hold_duration_s == pytest.approx(0.16)
+    assert resolved.success_hold_duration_s == pytest.approx(2.0)
     assert resolved.reward_mode == "angular_progress"
 
 
@@ -148,7 +149,9 @@ class _EvaluationStateEnv:
             102: (2.0 * np.pi / 3.0, 1.0),
         }
         angle, error = reset[seed]
-        return self._observation(), {
+        observation = self._observation()
+        observation["state"][0] = seed / 1000.0
+        return observation, {
             "target_rotation_angle_rad": angle,
             "orientation_error_rad": error,
             "success_tolerance_rad": 0.4,
@@ -457,3 +460,118 @@ def test_state_cli_rejects_both_tolerance_units() -> None:
                 "15",
             ]
         )
+
+
+@pytest.mark.parametrize("preset", ["turn_30", "turn_45", "turn_60"])
+def test_corrected_curriculum_keeps_support_but_zero_action_cannot_solve(preset) -> None:
+    env = training.make_state_env(resolve_preset(StateTrainConfig(preset=preset)))
+    try:
+        observations = []
+        for seed in (10000, 10001, 10002):
+            obs, info = env.reset(seed=seed)
+            observations.append(obs["state"])
+            assert obs["state"].shape == (64,)
+            assert env.action_space.shape == (16,)
+            assert info["orientation_error_rad"] > info["success_tolerance_rad"]
+            assert info["cube_pos"][2] > 0.12
+            for _ in range(100):
+                _, _, terminated, truncated, info = env.step(np.zeros(16, dtype=np.float32))
+                assert not info["dropped"]
+                assert not info["is_success"]
+                if terminated or truncated:
+                    break
+            assert info["termination_reason"] == "task_timeout"
+        assert not np.array_equal(observations[0], observations[1])
+        repeated, _ = env.reset(seed=10000)
+        np.testing.assert_array_equal(observations[0], repeated["state"])
+    finally:
+        env.close()
+
+
+def test_evaluation_exposes_duplicate_initial_states() -> None:
+    result = evaluate_state(_ZeroAgent(), _TinyStateEnv(), episodes=3, seed=10000)
+    assert result["unique_initial_states"] == 1
+    assert result["success_rate_ci95"] is None
+    assert result["mean_episode_length"] == 2.0
+
+
+def test_warm_start_uses_fresh_stage_steps_and_exploration(tmp_path) -> None:
+    source = tmp_path / "parent.pt"
+    StateAgent(47, 16, "cpu", StateAgentConfig(hidden_dim=32)).save(source, 600000)
+    environments = []
+    def factory():
+        env = _TinyStateEnv()
+        environments.append(env)
+        return env
+    train_state(StateTrainConfig(
+        warm_start=source, total_steps=4, seed_steps=4, hidden_dim=32,
+        batch_size=2, replay_capacity=16, eval_every_steps=0, device="cpu",
+        output_dir=tmp_path / "new_stage",
+    ), env_factory=factory)
+    assert len(environments[0].actions) == 4
+    assert all(np.max(np.abs(a)) <= 0.1 for a in environments[0].actions)
+    assert (tmp_path / "new_stage" / "checkpoint_4.pt").exists()
+
+
+def test_cli_warm_start_and_resume_are_mutually_exclusive() -> None:
+    with pytest.raises(SystemExit):
+        parse_args(["--warm-start", "parent.pt", "--resume", "same.pt"])
+
+
+def test_resume_preserves_exploration_clock(tmp_path) -> None:
+    source = StateAgent(47, 16, "cpu", StateAgentConfig(hidden_dim=32))
+    for parameter in source.actor.parameters():
+        parameter.data.zero_()
+    source.save(tmp_path / "parent.pt", 10)
+    environments = []
+    def factory():
+        env = _TinyStateEnv()
+        environments.append(env)
+        return env
+    train_state(StateTrainConfig(
+        resume=tmp_path / "parent.pt", total_steps=14, seed_steps=0,
+        behavior_stddev_schedule="linear(0.2,0.0,10)",
+        hidden_dim=32, batch_size=16, replay_capacity=16,
+        eval_every_steps=0, device="cpu", output_dir=tmp_path / "resumed",
+    ), env_factory=factory)
+    assert len(environments[0].actions) == 4
+    for action in environments[0].actions:
+        np.testing.assert_array_equal(action, np.zeros(16))
+
+
+def test_incompatible_checkpoint_closes_environments(tmp_path) -> None:
+    source = StateAgent(64, 16, "cpu", StateAgentConfig(hidden_dim=32))
+    source.save(tmp_path / "parent.pt", 10)
+    environments = []
+    def factory():
+        env = _TinyStateEnv()
+        environments.append(env)
+        return env
+    with pytest.raises(ValueError, match="state_dim"):
+        train_state(StateTrainConfig(
+            warm_start=tmp_path / "parent.pt", hidden_dim=32, device="cpu",
+            output_dir=tmp_path / "invalid",
+        ), env_factory=factory)
+    assert all(env.closed for env in environments)
+
+
+def test_existing_run_is_not_overwritten(tmp_path) -> None:
+    metrics = tmp_path / "metrics.jsonl"
+    metrics.write_text("existing run\n")
+    with pytest.raises(FileExistsError, match="output"):
+        train_state(StateTrainConfig(output_dir=tmp_path, total_steps=0), env_factory=_TinyStateEnv)
+    assert metrics.read_text() == "existing run\n"
+
+
+def test_zero_action_comparison_is_logged(tmp_path) -> None:
+    train_state(StateTrainConfig(
+        total_steps=2, seed_steps=2, hidden_dim=32, device="cpu",
+        eval_every_steps=2, eval_episodes=1, replay_capacity=16,
+        output_dir=tmp_path,
+    ), env_factory=_TinyStateEnv)
+    events = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
+    baseline = next(x for x in events if x["type"] == "zero_action_evaluation")
+    evaluation = next(x for x in events if x["type"] == "evaluation")
+    assert baseline["success_rate"] == 1.0
+    assert evaluation["zero_action_success_rate"] == 1.0
+    assert evaluation["success_rate_gain_over_zero"] == 0.0

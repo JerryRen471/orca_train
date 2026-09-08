@@ -153,7 +153,7 @@ class StateAgent:
             path,
         )
 
-    def load(self, path: str | Path) -> int:
+    def _load_checkpoint(self, path: str | Path) -> dict:
         state = torch.load(path, map_location=self.device, weights_only=True)
         expected_metadata = {
             "observation_mode": "state",
@@ -174,6 +174,16 @@ class StateAgent:
                 "Incompatible checkpoint hidden_dim: expected "
                 f"{self.config.hidden_dim!r}, got {checkpoint_hidden_dim!r}"
             )
+        return state
+
+    def load_actor(self, path: str | Path) -> int:
+        """Transfer a policy to a new curriculum with fresh critics/optimizers."""
+        state = self._load_checkpoint(path)
+        self.actor.load_state_dict(state["actor"])
+        return int(state["step"])
+
+    def load(self, path: str | Path) -> int:
+        state = self._load_checkpoint(path)
         for name in ("actor", "critic", "critic_target"):
             getattr(self, name).load_state_dict(state[name])
         for name in ("actor_optimizer", "critic_optimizer"):

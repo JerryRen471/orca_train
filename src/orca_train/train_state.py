@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 from dataclasses import asdict, dataclass, replace
+from contextlib import closing
 from pathlib import Path
 from typing import Callable
 
@@ -37,9 +39,10 @@ class StateTrainConfig:
     device: str = "auto"
     output_dir: Path | None = None
     resume: Path | None = None
+    warm_start: Path | None = None
     max_delta_degrees: float = 3.0
     hidden_dim: int = 1024
-    fix_wrist: bool = False
+    fix_wrist: bool = True
     joint_velocity_limit: float = 10.0
     workspace_radius: float = 0.25
     linear_velocity_limit: float = 2.0
@@ -54,6 +57,10 @@ class StateTrainConfig:
     step_penalty: float = 0.01
     gate_orientation_progress_on_grasp: bool = True
     grasp_height_reward_scale: float = 0.01
+    stable_hold_reward_scale: float = 0.1
+    reset_settle_duration_s: float = 1.0
+    cube_pos_xy_jitter: float = 0.001
+    target_relative_to_reset: bool = True
     target_policy: str | None = None
     target_sequence_length: int | None = None
     target_rotation_angle_rad: float | None = None
@@ -64,6 +71,12 @@ class StateTrainConfig:
     reward_mode: str | None = None
 
     def __post_init__(self) -> None:
+        if self.resume is not None and self.warm_start is not None:
+            raise ValueError("resume and warm_start are mutually exclusive")
+        for name in ("stable_hold_reward_scale", "reset_settle_duration_s", "cube_pos_xy_jitter"):
+            value = getattr(self, name)
+            if not np.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
         if not (
             np.isfinite(self.seed_action_scale)
             and 0.0 <= self.seed_action_scale <= 1.0
@@ -236,7 +249,7 @@ def resolve_preset(config: StateTrainConfig) -> StateTrainConfig:
         **_PRESETS[config.preset],
         "control_period_s": 0.08,
         "max_task_duration_s": 8.0,
-        "success_hold_duration_s": 0.16,
+        "success_hold_duration_s": 2.0,
         "reward_mode": "angular_progress",
     }
     resolved = {
@@ -261,6 +274,10 @@ def _rotation_bucket(angle_rad: float) -> str | None:
 
 
 def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    initial_states = set()
+    episode_lengths = []
     returns = []
     successes = []
     drops = []
@@ -285,6 +302,9 @@ def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
 
     for episode in range(episodes):
         observation, reset_info = env.reset(seed=seed + episode)
+        initial_states.add(hashlib.sha256(
+            np.asarray(observation["state"], dtype=np.float32).tobytes()
+        ).digest())
         funnel = _episode_funnel(reset_info, env)
         record_attempt(reset_info.get("target_rotation_angle_rad"))
         episode_return = 0.0
@@ -329,6 +349,7 @@ def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
                     record_attempt(info.get("target_rotation_angle_rad"))
 
         returns.append(episode_return)
+        episode_lengths.append(episode_steps)
         successes.append(success)
         drops.append(dropped)
         timeouts.append(info.get("termination_reason") == "task_timeout")
@@ -388,10 +409,14 @@ def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
     }
 
     return {
+        "episodes": episodes,
+        "unique_initial_states": len(initial_states),
+        "mean_episode_length": float(np.mean(episode_lengths)),
         "return": float(np.mean(returns)),
         "success_rate": float(np.mean(successes)),
-        "success_rate_ci95": _wilson_interval(
-            int(np.sum(successes)), len(successes)
+        "success_rate_ci95": (
+            _wilson_interval(int(np.sum(successes)), len(successes))
+            if len(initial_states) == episodes else None
         ),
         "mean_targets_completed": float(np.mean(targets_completed)),
         "median_targets_completed": float(np.median(targets_completed)),
@@ -411,6 +436,49 @@ def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
     }
 
 
+def make_state_env(config: StateTrainConfig) -> OrcaStateCubeEnv:
+    config = resolve_preset(config)
+    return OrcaStateCubeEnv(
+        max_delta_degrees=config.max_delta_degrees,
+        fixed_joint_names=("right_wrist",) if config.fix_wrist else (),
+        joint_velocity_limit=config.joint_velocity_limit,
+        workspace_radius=config.workspace_radius,
+        linear_velocity_limit=config.linear_velocity_limit,
+        angular_velocity_limit=config.angular_velocity_limit,
+        goal_mode="cube_orientation",
+        target_policy=config.target_policy,
+        target_sequence_length=config.target_sequence_length,
+        target_rotation_angle_rad=config.target_rotation_angle_rad,
+        success_tolerance_rad=config.success_tolerance_rad,
+        control_period_s=config.control_period_s,
+        max_task_duration_s=config.max_task_duration_s,
+        success_hold_duration_s=config.success_hold_duration_s,
+        drop_penalty=config.drop_penalty,
+        drop_height=config.drop_height,
+        success_height=config.success_height,
+        max_success_linear_speed=config.max_success_linear_speed,
+        max_success_angular_speed=config.max_success_angular_speed,
+        reward_mode=config.reward_mode,
+        progress_reward_scale=config.progress_reward_scale,
+        success_bonus=config.success_bonus,
+        step_penalty=config.step_penalty,
+        gate_orientation_progress_on_grasp=config.gate_orientation_progress_on_grasp,
+        grasp_height_reward_scale=config.grasp_height_reward_scale,
+        stable_hold_reward_scale=config.stable_hold_reward_scale,
+        reset_settle_duration_s=config.reset_settle_duration_s,
+        cube_pos_xy_jitter=config.cube_pos_xy_jitter,
+        target_relative_to_reset=config.target_relative_to_reset,
+    )
+
+
+class _ZeroActionAgent:
+    def __init__(self, action_dim: int):
+        self.action_dim = action_dim
+
+    def act(self, observation, step, eval_mode=False):
+        return np.zeros(self.action_dim, dtype=np.float32)
+
+
 def train_state(
     config: StateTrainConfig,
     env_factory: Callable[[], object] | None = None,
@@ -422,88 +490,58 @@ def train_state(
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     rng = np.random.default_rng(config.seed)
-    config.output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = config.output_dir / "metrics.jsonl"
-    (config.output_dir / "config.json").write_text(
-        json.dumps(asdict(config), default=str, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    if (metrics_path.exists() or (config.output_dir / "config.json").exists()
+            or any(config.output_dir.glob("checkpoint_*.pt"))):
+        raise FileExistsError("Training output already exists; choose a fresh output directory")
+    config.output_dir.mkdir(parents=True, exist_ok=True)
 
     if env_factory is None:
-        fixed_joint_names = ("right_wrist",) if config.fix_wrist else ()
-        task_values = {
-            "target_policy": config.target_policy,
-            "target_sequence_length": config.target_sequence_length,
-            "target_rotation_angle_rad": config.target_rotation_angle_rad,
-            "success_tolerance_rad": config.success_tolerance_rad,
-            "control_period_s": config.control_period_s,
-            "max_task_duration_s": config.max_task_duration_s,
-            "success_hold_duration_s": config.success_hold_duration_s,
-            "reward_mode": config.reward_mode,
-        }
-        if any(value is None for value in task_values.values()):
-            raise ValueError("State curriculum must be fully resolved")
+        env_factory = lambda: make_state_env(config)
 
-        def env_factory() -> OrcaStateCubeEnv:
-            return OrcaStateCubeEnv(
-                max_delta_degrees=config.max_delta_degrees,
-                fixed_joint_names=fixed_joint_names,
-                joint_velocity_limit=config.joint_velocity_limit,
-                workspace_radius=config.workspace_radius,
-                linear_velocity_limit=config.linear_velocity_limit,
-                angular_velocity_limit=config.angular_velocity_limit,
-                goal_mode="cube_orientation",
-                target_policy=config.target_policy,
-                target_sequence_length=config.target_sequence_length,
-                target_rotation_angle_rad=config.target_rotation_angle_rad,
-                success_tolerance_rad=config.success_tolerance_rad,
-                control_period_s=config.control_period_s,
-                max_task_duration_s=config.max_task_duration_s,
-                success_hold_duration_s=config.success_hold_duration_s,
-                drop_penalty=config.drop_penalty,
-                drop_height=config.drop_height,
-                success_height=config.success_height,
-                max_success_linear_speed=config.max_success_linear_speed,
-                max_success_angular_speed=config.max_success_angular_speed,
-                reward_mode=config.reward_mode,
-                progress_reward_scale=config.progress_reward_scale,
-                success_bonus=config.success_bonus,
-                step_penalty=config.step_penalty,
-                gate_orientation_progress_on_grasp=(
-                    config.gate_orientation_progress_on_grasp
-                ),
-                grasp_height_reward_scale=config.grasp_height_reward_scale,
+    with closing(env_factory()) as env, closing(env_factory()) as eval_env:
+        observation, reset_info = env.reset(seed=config.seed)
+        state_dim = int(observation["state"].size)
+        action_dim = int(env.action_space.shape[0])
+        device = select_device(config.device)
+        agent = StateAgent(
+            state_dim,
+            action_dim,
+            device,
+            StateAgentConfig(
+                hidden_dim=config.hidden_dim,
+                batch_size=config.batch_size,
+                stddev_schedule=config.behavior_stddev_schedule,
+                stddev_clip=config.behavior_stddev_clip,
+            ),
+        )
+        replay = StateReplayBuffer(
+            config.replay_capacity, state_dim, action_dim, config.seed
+        )
+        accumulator = NStepAccumulator(config.nstep, config.gamma)
+        start_step = agent.load(config.resume) if config.resume else 0
+        if config.warm_start is not None:
+            agent.load_actor(config.warm_start)
+        episode_return = 0.0
+        episode_length = 0
+        episode_funnel = _episode_funnel(reset_info, env)
+
+        (config.output_dir / "config.json").write_text(
+            json.dumps(asdict(config), default=str, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        zero_baseline = None
+        if config.eval_every_steps:
+            zero_baseline = evaluate_state(
+                _ZeroActionAgent(action_dim), eval_env,
+                config.eval_episodes, config.eval_seed,
             )
-
-    env = env_factory()
-    eval_env = env_factory()
-    observation, reset_info = env.reset(seed=config.seed)
-    state_dim = int(observation["state"].size)
-    action_dim = int(env.action_space.shape[0])
-    device = select_device(config.device)
-    agent = StateAgent(
-        state_dim,
-        action_dim,
-        device,
-        StateAgentConfig(
-            hidden_dim=config.hidden_dim,
-            batch_size=config.batch_size,
-            stddev_schedule=config.behavior_stddev_schedule,
-            stddev_clip=config.behavior_stddev_clip,
-        ),
-    )
-    replay = StateReplayBuffer(
-        config.replay_capacity, state_dim, action_dim, config.seed
-    )
-    accumulator = NStepAccumulator(config.nstep, config.gamma)
-    start_step = agent.load(config.resume) if config.resume else 0
-    episode_return = 0.0
-    episode_length = 0
-    episode_funnel = _episode_funnel(reset_info, env)
-
-    try:
+            event = {"type": "zero_action_evaluation", "step": start_step, **zero_baseline}
+            write_metric(metrics_path, event)
+            print(json.dumps(event, ensure_ascii=False), flush=True)
         for step in range(start_step + 1, config.total_steps + 1):
-            if step <= config.seed_steps:
+            stage_step = step - start_step
+            if stage_step <= config.seed_steps:
                 action = rng.uniform(
                     -config.seed_action_scale,
                     config.seed_action_scale,
@@ -535,7 +573,7 @@ def train_state(
             episode_length += 1
             episode_funnel.observe(info, episode_step=episode_length)
 
-            if step > config.seed_steps and len(replay) >= config.batch_size:
+            if stage_step > config.seed_steps and len(replay) >= config.batch_size:
                 update_metrics = agent.update(replay, step)
                 if update_metrics:
                     write_metric(
@@ -571,6 +609,10 @@ def train_state(
                     agent, eval_env, config.eval_episodes, config.eval_seed
                 )
                 event = {"type": "evaluation", "step": step, **result}
+                event["zero_action_success_rate"] = zero_baseline["success_rate"]
+                event["success_rate_gain_over_zero"] = (
+                    result["success_rate"] - zero_baseline["success_rate"]
+                )
                 write_metric(metrics_path, event)
                 print(json.dumps(event, ensure_ascii=False), flush=True)
 
@@ -583,9 +625,6 @@ def train_state(
         final_path = config.output_dir / f"checkpoint_{config.total_steps}.pt"
         if not final_path.exists():
             agent.save(final_path, config.total_steps)
-    finally:
-        env.close()
-        eval_env.close()
 
 
 def parse_args(argv: list[str] | None = None) -> StateTrainConfig:
@@ -625,10 +664,12 @@ def parse_args(argv: list[str] | None = None) -> StateTrainConfig:
         "--device", default="auto", choices=("auto", "cpu", "mps", "cuda")
     )
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--resume", type=Path)
+    initialization = parser.add_mutually_exclusive_group()
+    initialization.add_argument("--resume", type=Path)
+    initialization.add_argument("--warm-start", type=Path)
     parser.add_argument("--max-delta-degrees", type=float, default=3.0)
     parser.add_argument("--hidden-dim", type=int, default=1024)
-    parser.add_argument("--fix-wrist", action="store_true")
+    parser.add_argument("--fix-wrist", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--joint-velocity-limit", type=float, default=10.0)
     parser.add_argument("--workspace-radius", type=float, default=0.25)
     parser.add_argument("--linear-velocity-limit", type=float, default=2.0)
@@ -648,6 +689,12 @@ def parse_args(argv: list[str] | None = None) -> StateTrainConfig:
     )
     parser.add_argument(
         "--grasp-height-reward-scale", type=float, default=0.01
+    )
+    parser.add_argument("--stable-hold-reward-scale", type=float, default=0.1)
+    parser.add_argument("--reset-settle-duration-s", type=float, default=1.0)
+    parser.add_argument("--cube-pos-xy-jitter", type=float, default=0.001)
+    parser.add_argument(
+        "--target-relative-to-reset", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument(
         "--target-policy",

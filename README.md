@@ -18,7 +18,7 @@ checkpoint formats.
 
 ## State baseline
 
-The state trainer uses a bounded 47-value observation in this order:
+The state trainer uses a bounded 64-value observation in this order:
 
 1. 17 actuator positions normalized by joint ROM.
 2. 17 actuator velocities scaled by a configured limit.
@@ -26,26 +26,35 @@ The state trainer uses a bounded 47-value observation in this order:
 4. Cube linear velocity in the hand-mount frame.
 5. Cube angular velocity in the hand-mount frame.
 6. The canonical relative target quaternion in MuJoCo `wxyz` order.
+7. The 17 position-controller targets normalized by joint ROM.
 
-Actions remain normalized measured-state-relative joint increments. State
+Actions accumulate onto the previous controller targets: zero action preserves
+the load-bearing setpoint instead of following joint sag. The wrist setpoint is
+held by default (16 policy actions); `--no-fix-wrist` enables all 17 joints. State
 checkpoints record `observation_mode`, state dimension, and action dimension;
 loading a visual checkpoint into the state trainer, or vice versa, is rejected
-with a compatibility error.
+with a compatibility error. Old 47-value state checkpoints are incompatible with
+this controller and must not be resumed or used to initialize the new policy.
 
 The static curricula are:
 
 | Preset | Target policy | Sequence | Tolerance | Target duration | Hold | Control period |
 |---|---|---:|---:|---:|---:|---:|
-| `turn_30` | fixed +30° hand-X turn | 1 | 15° | 8.0 s | 0.16 s | 0.08 s |
-| `turn_45` | fixed +45° hand-X turn | 1 | 15° | 8.0 s | 0.16 s | 0.08 s |
-| `turn_60` | fixed +60° hand-X turn | 1 | 15° | 8.0 s | 0.16 s | 0.08 s |
-| `single_goal` | fixed +90° hand-X turn | 1 | 0.4 rad | 8.0 s | 0.16 s | 0.08 s |
-| `right_angle` | random ±90° hand axis | 1 | 0.4 rad | 8.0 s | 0.16 s | 0.08 s |
-| `multi_goal` | shuffled 24-orientation bag | 20 | 15° | 8.0 s | 0.16 s | 0.08 s |
+| `turn_30` | fixed +30° hand-X turn | 1 | 15° | 8.0 s | 2.0 s | 0.08 s |
+| `turn_45` | fixed +45° hand-X turn | 1 | 15° | 8.0 s | 2.0 s | 0.08 s |
+| `turn_60` | fixed +60° hand-X turn | 1 | 15° | 8.0 s | 2.0 s | 0.08 s |
+| `single_goal` | fixed +90° hand-X turn | 1 | 0.4 rad | 8.0 s | 2.0 s | 0.08 s |
+| `right_angle` | random ±90° hand axis | 1 | 0.4 rad | 8.0 s | 2.0 s | 0.08 s |
+| `multi_goal` | shuffled 24-orientation bag | 20 | 15° | 8.0 s | 2.0 s | 0.08 s |
 
 Each preset uses angular-error progress reward. Training does not advance between
 presets automatically; start a new run explicitly after evaluating the previous
-stage.
+stage. Reset holds the initial controller targets for 1 second before drawing a
+goal from the settled cube orientation. The initial XY position is independently
+jittered by up to 1 mm per axis, using the reset seed. The fixed turns and the
+orientation bag use this settled reference; random turns use the current pose.
+`--reset-settle-duration-s`, `--cube-pos-xy-jitter`, and
+`--no-target-relative-to-reset` allow controlled comparisons.
 
 ## Install
 
@@ -101,7 +110,7 @@ uv run orca-train-state \
   --device mps \
   --total-steps 1000000 \
   --eval-episodes 100 \
-  --output-dir runs/state_cube_turn_30_seed1
+  --output-dir runs/state_cube_turn_30_support_seed1
 ```
 
 Use `--device cuda` on an NVIDIA machine or `--device cpu` for a short
@@ -113,13 +122,34 @@ interval for success rate, and
 90°/120°/180° target buckets. It also records the 60°/45°/30°/success-tolerance
 funnel, drop step, maximum stable-success streak, and the cube height and speed
 when the tolerance is first reached. Evaluation defaults to 100 fixed-seed
-episodes; event-conditioned means are `null` when no matching event occurred.
+episodes. It reports the number of distinct initial state vectors and suppresses
+the confidence interval if any initial states repeat. Each run also evaluates a
+zero-action controller on the same seeds and logs success-rate gain over that
+baseline. A course must outperform zero action and meet the full hold requirement
+before promotion; a high angle-only funnel rate is insufficient.
 
 The default exploration policy uses `linear(0.2,0.05,100000)` Gaussian noise
 clipped to `0.2`; the replay warm-up samples only within `±0.1`. Angular progress
-is gated on both cube height and hand contact, with a `0.01` height-hold shaping
-reward. These values can be overridden with the corresponding command-line
-options for controlled ablations.
+is rewarded only with sufficient height, hand contact and bounded linear/angular
+speed. Negative angular progress remains penalized when grasp is lost. The
+`0.01` height shaping term is supplemented by a `0.1` reward on each stable step
+inside target tolerance. These values can be overridden for controlled ablations.
+
+Promote a **new-format** checkpoint with actor-only transfer:
+
+```bash
+uv run orca-train-state --preset turn_45 --device cuda \
+  --warm-start runs/state_cube_turn_30_support_seed1/checkpoint_100000.pt \
+  --total-steps 100000 --output-dir runs/state_cube_turn_45_support_seed1
+```
+
+`--warm-start` resets critics, optimizers, replay, step count, and exploration for
+the new course. `--resume` restores the actor, critics, optimizers and saved step
+count for the same course; its `--total-steps` is the cumulative stopping point.
+Replay is not checkpointed, so resume refills replay for `--seed-steps` before
+learning, while preserving the saved noise-schedule progress. Both modes require
+the same observation/action dimensions and network width. Use a fresh output
+directory for every experiment or resumed segment to keep logs comparable.
 
 A four-step smoke run verifies environment construction, replay insertion,
 gradient updates, evaluation, checkpoint save, and checkpoint load. It does not
