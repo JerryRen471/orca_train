@@ -25,9 +25,13 @@ class OrcaStateCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         workspace_radius: float = 0.25,
         linear_velocity_limit: float = 2.0,
         angular_velocity_limit: float = 20.0,
+        joint_limit_penalty_scale: float = 0.0,
         **task_kwargs: Any,
     ) -> None:
         super().__init__()
+        if not np.isfinite(joint_limit_penalty_scale) or joint_limit_penalty_scale < 0:
+            raise ValueError("joint_limit_penalty_scale must be finite and non-negative")
+        self.joint_limit_penalty_scale = float(joint_limit_penalty_scale)
         scales = {
             "max_delta_degrees": max_delta_degrees,
             "joint_velocity_limit": joint_velocity_limit,
@@ -205,6 +209,13 @@ class OrcaStateCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         info["controller_tracking_error_rms_deg"] = float(np.rad2deg(
             np.sqrt(np.mean((self._target[active] - measured) ** 2))
         ))
+        target_fraction = (self._target[active] - self._joint_low[active]) / ranges
+        distance_to_limit = np.minimum(target_fraction, 1.0 - target_fraction)
+        proximity = np.clip(1.0 - distance_to_limit / 0.05, 0.0, 1.0)
+        penalty = self.joint_limit_penalty_scale * float(np.square(proximity).sum())
+        info["task_reward"] = float(reward)
+        info["joint_limit_penalty"] = penalty
+        reward = float(reward) - penalty
         return self._observation(info), float(reward), terminated, truncated, info
 
     def close(self) -> None:

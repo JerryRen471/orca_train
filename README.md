@@ -153,6 +153,21 @@ zero-action controller on the same seeds and logs success-rate gain over that
 baseline. A course must outperform zero action and meet the full hold requirement
 before promotion; a high angle-only funnel rate is insufficient.
 
+To discourage cumulative targets sticking at joint limits, state training adds
+a smooth penalty inside the outer 5% of each active joint's ROM. For normalized
+distance `d` to the nearest limit, the per-joint cost is
+`joint_limit_penalty_scale * clip(1 - d / 0.05, 0, 1)^2`, summed over active joints.
+The scale defaults to 0.1; `--joint-limit-penalty-scale 0` disables it. Full ROM and
+action ranges remain available, and the default reset targets lie outside the
+penalty region. Evaluation reports raw `task_return` separately from `return`,
+which includes this control penalty. Value calibration uses the latter objective.
+
+Use a fresh critic when changing this reward term. Resuming a trainer run checks
+its adjacent `config.json` and rejects a changed limit-penalty scale; manifests
+from before this feature imply scale zero. Standalone agent checkpoints without
+a trainer manifest do not contain environment reward metadata, so their caller
+must supply the matching environment configuration.
+
 Evaluation also reports action RMS, the fraction of action components above 0.95
 in magnitude, and the fraction of active joint targets/positions within 1% of
 either ROM limit. The fixed wrist is excluded. `mean_value_bias_terminal`

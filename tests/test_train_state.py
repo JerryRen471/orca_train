@@ -310,6 +310,8 @@ def test_evaluation_calibrates_value_only_on_terminal_returns(truncated):
         def step(self, action):
             obs, reward, terminal, _, info = super().step(action)
             info["joint_target_limit_fraction"] = 0.25 if self.steps == 1 else 0.75
+            info["task_reward"] = 2.0
+            info["joint_limit_penalty"] = 1.0
             return obs, reward, terminal and not truncated, terminal and truncated, info
 
     result = evaluate_state(KnownAgent(), KnownEnv(), episodes=1, seed=100, gamma=0.5)
@@ -320,6 +322,35 @@ def test_evaluation_calibrates_value_only_on_terminal_returns(truncated):
     assert result["action_rms"] == pytest.approx(np.sqrt(0.5))
     assert result["action_saturation_fraction"] == 0.5
     assert result["mean_joint_target_limit_fraction"] == 0.5
+    assert result["task_return"] == 4.0
+    assert result["mean_joint_limit_penalty"] == 1.0
+
+
+def test_limit_penalty_cli_and_validation():
+    assert parse_args(["--joint-limit-penalty-scale", "0"]).joint_limit_penalty_scale == 0
+    with pytest.raises(ValueError, match="joint_limit_penalty_scale"):
+        StateTrainConfig(joint_limit_penalty_scale=-0.1)
+
+
+def test_resume_cannot_silently_change_previous_run_limit_penalty(tmp_path):
+    previous = tmp_path / "previous"
+    previous.mkdir()
+    checkpoint = previous / "checkpoint_2.pt"
+    StateAgent(47, 16, "cpu", StateAgentConfig(hidden_dim=32)).save(checkpoint, 2)
+    # Older run manifests predate the penalty and therefore mean scale zero.
+    (previous / "config.json").write_text(json.dumps({"preset": "turn_30"}))
+    with pytest.raises(ValueError, match="joint_limit_penalty_scale"):
+        train_state(StateTrainConfig(
+            resume=checkpoint, total_steps=4, hidden_dim=32,
+            output_dir=tmp_path / "bad_resume", eval_every_steps=0,
+        ), env_factory=_TinyStateEnv)
+    assert not (tmp_path / "bad_resume" / "config.json").exists()
+    train_state(StateTrainConfig(
+        resume=checkpoint, total_steps=4, hidden_dim=32, seed_steps=0,
+        batch_size=2, replay_capacity=10, eval_every_steps=0,
+        joint_limit_penalty_scale=0.0, output_dir=tmp_path / "matching_resume",
+    ), env_factory=_TinyStateEnv)
+    assert (tmp_path / "matching_resume" / "checkpoint_4.pt").exists()
 
 
 class _TinyStateEnv:

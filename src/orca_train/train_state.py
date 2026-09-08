@@ -42,6 +42,7 @@ class StateTrainConfig:
     resume: Path | None = None
     warm_start: Path | None = None
     max_delta_degrees: float = 3.0
+    joint_limit_penalty_scale: float = 0.1
     hidden_dim: int = 1024
     fix_wrist: bool = True
     joint_velocity_limit: float = 10.0
@@ -77,7 +78,7 @@ class StateTrainConfig:
             raise ValueError("behavior_regularization_alpha must be finite and non-negative")
         if self.resume is not None and self.warm_start is not None:
             raise ValueError("resume and warm_start are mutually exclusive")
-        for name in ("stable_hold_reward_scale", "reset_settle_duration_s", "cube_pos_xy_jitter"):
+        for name in ("stable_hold_reward_scale", "reset_settle_duration_s", "cube_pos_xy_jitter", "joint_limit_penalty_scale"):
             value = getattr(self, name)
             if not np.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
@@ -285,6 +286,7 @@ def evaluate_state(agent, env, episodes: int, seed: int, gamma: float = 0.99) ->
     initial_states = set()
     episode_lengths = []
     returns = []
+    task_returns = []
     successes = []
     drops = []
     timeouts = []
@@ -299,6 +301,7 @@ def evaluate_state(agent, env, episodes: int, seed: int, gamma: float = 0.99) ->
     control_metrics = {name: [] for name in (
         "joint_target_limit_fraction", "joint_position_limit_fraction",
         "controller_tracking_error_rms_deg",
+        "joint_limit_penalty",
     )}
 
     def record_attempt(angle_rad: float | None) -> None:
@@ -320,6 +323,7 @@ def evaluate_state(agent, env, episodes: int, seed: int, gamma: float = 0.99) ->
         funnel = _episode_funnel(reset_info, env)
         record_attempt(reset_info.get("target_rotation_angle_rad"))
         episode_return = 0.0
+        task_return = 0.0
         success = False
         dropped = False
         done = False
@@ -343,6 +347,7 @@ def evaluate_state(agent, env, episodes: int, seed: int, gamma: float = 0.99) ->
             episode_steps += 1
             funnel.observe(info, episode_step=episode_steps)
             episode_return += float(reward)
+            task_return += float(info.get("task_reward", reward))
             success = success or bool(info.get("is_success", False))
             dropped = dropped or bool(info.get("dropped", False))
             done = terminated or truncated
@@ -372,6 +377,7 @@ def evaluate_state(agent, env, episodes: int, seed: int, gamma: float = 0.99) ->
                     record_attempt(info.get("target_rotation_angle_rad"))
 
         returns.append(episode_return)
+        task_returns.append(task_return)
         discounted_returns.append(discounted_return)
         if terminated and initial_value is not None:
             value_biases.append(initial_value - discounted_return)
@@ -447,6 +453,7 @@ def evaluate_state(agent, env, episodes: int, seed: int, gamma: float = 0.99) ->
         "unique_initial_states": len(initial_states),
         "mean_episode_length": float(np.mean(episode_lengths)),
         "return": float(np.mean(returns)),
+        "task_return": float(np.mean(task_returns)),
         "success_rate": float(np.mean(successes)),
         "success_rate_ci95": (
             _wilson_interval(int(np.sum(successes)), len(successes))
@@ -474,6 +481,7 @@ def make_state_env(config: StateTrainConfig) -> OrcaStateCubeEnv:
     config = resolve_preset(config)
     return OrcaStateCubeEnv(
         max_delta_degrees=config.max_delta_degrees,
+        joint_limit_penalty_scale=config.joint_limit_penalty_scale,
         fixed_joint_names=("right_wrist",) if config.fix_wrist else (),
         joint_velocity_limit=config.joint_velocity_limit,
         workspace_radius=config.workspace_radius,
@@ -520,6 +528,16 @@ def train_state(
     config = resolve_preset(config)
     if config.output_dir is None:
         raise RuntimeError("Resolved state training output directory is missing")
+    if config.resume is not None:
+        manifest = config.resume.parent / "config.json"
+        if manifest.is_file():
+            previous = json.loads(manifest.read_text(encoding="utf-8"))
+            previous_penalty = previous.get("joint_limit_penalty_scale", 0.0)
+            if previous_penalty != config.joint_limit_penalty_scale:
+                raise ValueError(
+                    "resume changes joint_limit_penalty_scale; use warm_start "
+                    "or keep the previous reward configuration"
+                )
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
@@ -710,6 +728,7 @@ def parse_args(argv: list[str] | None = None) -> StateTrainConfig:
     initialization.add_argument("--resume", type=Path)
     initialization.add_argument("--warm-start", type=Path)
     parser.add_argument("--max-delta-degrees", type=float, default=3.0)
+    parser.add_argument("--joint-limit-penalty-scale", type=float, default=0.1)
     parser.add_argument("--hidden-dim", type=int, default=1024)
     parser.add_argument("--fix-wrist", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--joint-velocity-limit", type=float, default=10.0)
