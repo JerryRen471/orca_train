@@ -193,6 +193,18 @@ class OrcaStateCubeEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             self._joint_high[active],
         ).astype(np.float32)
         _, reward, terminated, truncated, info = self.env.step(self._target)
+        info = dict(info)
+        ranges = self._joint_high[active] - self._joint_low[active]
+        measured = self._joint_angles()[active]
+        for name, positions in (
+            ("joint_target_limit_fraction", self._target[active]),
+            ("joint_position_limit_fraction", measured),
+        ):
+            normalized = (positions - self._joint_low[active]) / ranges
+            info[name] = float(np.mean((normalized <= 0.01) | (normalized >= 0.99)))
+        info["controller_tracking_error_rms_deg"] = float(np.rad2deg(
+            np.sqrt(np.mean((self._target[active] - measured) ** 2))
+        ))
         return self._observation(info), float(reward), terminated, truncated, info
 
     def close(self) -> None:

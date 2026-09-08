@@ -18,6 +18,19 @@ checkpoint formats.
 
 ## State baseline
 
+The state agent uses TD3 updates: a frozen target actor generates bootstrap
+actions, two critic updates precede each actor update, and both target networks
+track their online networks only after an actor update. Target-policy smoothing
+uses fixed noise (standard deviation 0.2, clip 0.5), independently of the behavior
+exploration schedule. The actor optimizes deterministic Q1. Network width,
+learning rate, replay, n-step returns and the environment control period retain
+the state baseline settings.
+
+Checkpoints identify this algorithm as `state_td3_v1` and save both target
+networks and the critic-update counter. Full resume rejects checkpoints from the
+previous state algorithm; a dimension-compatible actor can still be transferred
+with `--warm-start`, which synchronizes its target actor and starts fresh critics.
+
 The state trainer uses a bounded 64-value observation in this order:
 
 1. 17 actuator positions normalized by joint ROM.
@@ -127,6 +140,15 @@ the confidence interval if any initial states repeat. Each run also evaluates a
 zero-action controller on the same seeds and logs success-rate gain over that
 baseline. A course must outperform zero action and meet the full hold requirement
 before promotion; a high angle-only funnel rate is insufficient.
+
+Evaluation also reports action RMS, the fraction of action components above 0.95
+in magnitude, and the fraction of active joint targets/positions within 1% of
+either ROM limit. The fixed wrist is excluded. `mean_value_bias_terminal`
+compares the initial twin-critic minimum with the realized discounted return,
+using only episodes that terminate. Externally truncated episodes are excluded
+because their future return is unobserved; `value_calibration_episodes` records
+the comparison count. These diagnostics measure value error and aggressive
+control directly rather than inferring them from success rate alone.
 
 The default exploration policy uses `linear(0.2,0.05,100000)` Gaussian noise
 clipped to `0.2`; the replay warm-up samples only within `±0.1`. Angular progress

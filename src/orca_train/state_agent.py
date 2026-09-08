@@ -11,7 +11,6 @@ from torch.nn import functional as F
 from .agent import (
     Actor,
     Critic,
-    actor_loss_from_q_values,
     sample_noisy_action,
     schedule,
 )
@@ -27,8 +26,19 @@ class StateAgentConfig:
     stddev_clip: float = 0.2
     batch_size: int = 256
     update_every_steps: int = 2
+    policy_delay: int = 2
+    target_policy_noise: float = 0.2
+    target_noise_clip: float = 0.5
 
     def __post_init__(self) -> None:
+        for name in ("policy_delay", "update_every_steps"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        for name in ("target_policy_noise", "target_noise_clip"):
+            value = getattr(self, name)
+            if not np.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
         if not np.isfinite(self.stddev_clip) or self.stddev_clip < 0.0:
             raise ValueError("stddev_clip must be finite and non-negative")
         try:
@@ -54,6 +64,8 @@ class StateAgent:
         self.actor = Actor(
             self.state_dim, self.config.hidden_dim, self.action_dim
         ).to(self.device)
+        self.actor_target = copy.deepcopy(self.actor).requires_grad_(False)
+        self.critic_updates = 0
         self.critic = Critic(
             self.state_dim, self.config.hidden_dim, self.action_dim
         ).to(self.device)
@@ -88,16 +100,24 @@ class StateAgent:
             )
         return action.clamp(-1.0, 1.0).squeeze(0).cpu().numpy()
 
+    @torch.no_grad()
+    def value(self, observation: dict[str, np.ndarray]) -> float:
+        action = self.act(observation, step=0, eval_mode=True)
+        state = torch.as_tensor(observation["state"], dtype=torch.float32, device=self.device).unsqueeze(0)
+        action_tensor = torch.as_tensor(action, device=self.device).unsqueeze(0)
+        q1, q2 = self.critic(state, action_tensor)
+        return float(torch.minimum(q1, q2).item())
+
     def update(self, replay: StateReplayBuffer, step: int) -> dict[str, float]:
         if step % self.config.update_every_steps:
             return {}
         batch = replay.sample(self.config.batch_size, self.device)
 
         with torch.no_grad():
-            next_action = self.actor(batch.next_states)
-            stddev = schedule(self.config.stddev_schedule, step)
+            next_action = self.actor_target(batch.next_states)
             next_action = sample_noisy_action(
-                next_action, stddev, self.config.stddev_clip
+                next_action, self.config.target_policy_noise,
+                self.config.target_noise_clip,
             )
             target_q1, target_q2 = self.critic_target(
                 batch.next_states, next_action
@@ -111,40 +131,45 @@ class StateAgent:
         self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
         self.critic_optimizer.step()
-
-        action = sample_noisy_action(
-            self.actor(batch.states), stddev, self.config.stddev_clip
-        )
-        actor_q1, actor_q2 = self.critic(batch.states, action)
-        actor_loss = actor_loss_from_q_values(actor_q1, actor_q2)
-        self.actor_optimizer.zero_grad(set_to_none=True)
-        actor_loss.backward()
-        self.actor_optimizer.step()
-
-        with torch.no_grad():
-            for parameter, target_parameter in zip(
-                self.critic.parameters(), self.critic_target.parameters()
-            ):
-                target_parameter.lerp_(
-                    parameter, self.config.critic_target_tau
-                )
-
-        return {
+        self.critic_updates += 1
+        metrics = {
             "critic_loss": float(critic_loss.item()),
-            "actor_loss": float(actor_loss.item()),
             "q": float(q1.mean().item()),
             "target_q": float(target_q.mean().item()),
         }
+        if self.critic_updates % self.config.policy_delay == 0:
+            self.critic.requires_grad_(False)
+            try:
+                action = self.actor(batch.states)
+                actor_q1, _ = self.critic(batch.states, action)
+                actor_loss = -actor_q1.mean()
+                self.actor_optimizer.zero_grad(set_to_none=True)
+                actor_loss.backward()
+                self.actor_optimizer.step()
+            finally:
+                self.critic.requires_grad_(True)
+            metrics["actor_loss"] = float(actor_loss.item())
+            with torch.no_grad():
+                for online, target in (
+                    (self.actor, self.actor_target),
+                    (self.critic, self.critic_target),
+                ):
+                    for parameter, target_parameter in zip(online.parameters(), target.parameters()):
+                        target_parameter.lerp_(parameter, self.config.critic_target_tau)
+        return metrics
 
     def save(self, path: str | Path, step: int) -> None:
         torch.save(
             {
+                "algorithm": "state_td3_v1",
                 "observation_mode": "state",
                 "state_dim": self.state_dim,
                 "action_dim": self.action_dim,
                 "step": int(step),
                 "config": asdict(self.config),
                 "actor": self.actor.state_dict(),
+                "actor_target": self.actor_target.state_dict(),
+                "critic_updates": self.critic_updates,
                 "critic": self.critic.state_dict(),
                 "critic_target": self.critic_target.state_dict(),
                 "actor_optimizer": self.actor_optimizer.state_dict(),
@@ -180,12 +205,16 @@ class StateAgent:
         """Transfer a policy to a new curriculum with fresh critics/optimizers."""
         state = self._load_checkpoint(path)
         self.actor.load_state_dict(state["actor"])
+        self.actor_target.load_state_dict(state["actor"])
         return int(state["step"])
 
     def load(self, path: str | Path) -> int:
         state = self._load_checkpoint(path)
-        for name in ("actor", "critic", "critic_target"):
+        if state.get("algorithm") != "state_td3_v1":
+            raise ValueError("Incompatible checkpoint algorithm; use actor-only warm_start")
+        for name in ("actor", "actor_target", "critic", "critic_target"):
             getattr(self, name).load_state_dict(state[name])
+        self.critic_updates = int(state["critic_updates"])
         for name in ("actor_optimizer", "critic_optimizer"):
             getattr(self, name).load_state_dict(state[name])
         return int(state["step"])

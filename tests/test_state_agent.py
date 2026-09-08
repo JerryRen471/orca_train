@@ -1,9 +1,98 @@
+import copy
+from dataclasses import replace
+
 import numpy as np
 import pytest
 import torch
 
 from orca_train.replay import StateReplayBuffer
 from orca_train.state_agent import StateAgent, StateAgentConfig
+
+
+def _training_fixture():
+    torch.manual_seed(31)
+    agent = StateAgent(3, 2, "cpu", StateAgentConfig(
+        hidden_dim=16, batch_size=2, update_every_steps=1,
+        stddev_schedule="0", stddev_clip=0,
+    ))
+    replay = StateReplayBuffer(4, 3, 2, seed=5)
+    for value in (0.1, 0.5):
+        replay.add({"state": np.full(3, value)}, np.zeros(2), 1.0, 0.99,
+                   {"state": np.full(3, value + 0.1)})
+    return agent, replay
+
+
+def test_critic_gets_an_update_before_policy_and_targets_move():
+    agent, replay = _training_fixture()
+    actor_before = copy.deepcopy(agent.actor.state_dict())
+    critic_before = copy.deepcopy(agent.critic.state_dict())
+    target_before = copy.deepcopy(agent.critic_target.state_dict())
+    first = agent.update(replay, step=1)
+    assert any(not torch.equal(v, critic_before[k]) for k, v in agent.critic.state_dict().items())
+    for k, v in agent.actor.state_dict().items():
+        torch.testing.assert_close(v, actor_before[k], rtol=0, atol=0)
+    for k, v in agent.critic_target.state_dict().items():
+        torch.testing.assert_close(v, target_before[k], rtol=0, atol=0)
+    assert "actor_loss" not in first
+    second = agent.update(replay, step=2)
+    assert "actor_loss" in second
+    assert any(not torch.equal(v, actor_before[k]) for k, v in agent.actor.state_dict().items())
+
+
+def test_online_policy_change_does_not_change_frozen_bootstrap_target():
+    agent, replay = _training_fixture()
+    other, other_replay = copy.deepcopy((agent, replay))
+    with torch.no_grad():
+        other.actor.policy[-1].bias.add_(3)
+    torch.manual_seed(19)
+    baseline = agent.update(replay, step=1)
+    torch.manual_seed(19)
+    changed = other.update(other_replay, step=1)
+    assert changed["target_q"] == pytest.approx(baseline["target_q"], abs=1e-8)
+
+
+def test_behavior_schedule_does_not_change_target_smoothing():
+    agent, replay = _training_fixture()
+    other, other_replay = copy.deepcopy((agent, replay))
+    other.config = replace(other.config, stddev_schedule="1.0", stddev_clip=0.9)
+    torch.manual_seed(19)
+    baseline = agent.update(replay, step=1)
+    torch.manual_seed(19)
+    changed = other.update(other_replay, step=1)
+    assert changed["target_q"] == pytest.approx(baseline["target_q"], abs=1e-8)
+
+
+def test_resume_preserves_delayed_update_phase_and_target_actor(tmp_path):
+    agent, replay = _training_fixture()
+    agent.update(replay, step=1)
+    agent.save(tmp_path / "resume.pt", step=99)
+    restored, _ = _training_fixture()
+    assert restored.load(tmp_path / "resume.pt") == 99
+    torch.manual_seed(41)
+    expected = agent.update(copy.deepcopy(replay), step=100)
+    torch.manual_seed(41)
+    actual = restored.update(copy.deepcopy(replay), step=100)
+    assert "actor_loss" in actual
+    assert actual == expected
+    for network in ("actor", "actor_target", "critic", "critic_target"):
+        for original, loaded in zip(getattr(agent, network).parameters(), getattr(restored, network).parameters()):
+            torch.testing.assert_close(original, loaded)
+
+
+def test_legacy_checkpoint_allows_actor_transfer_but_rejects_optimizer_resume(tmp_path):
+    source, _ = _training_fixture()
+    checkpoint = tmp_path / "legacy.pt"
+    source.save(checkpoint, 20_000)
+    saved = torch.load(checkpoint, weights_only=True)
+    for field in ("algorithm", "actor_target", "critic_updates"):
+        saved.pop(field, None)
+    torch.save(saved, checkpoint)
+    target, _ = _training_fixture()
+    with pytest.raises(ValueError, match="algorithm"):
+        target.load(checkpoint)
+    target.load_actor(checkpoint)
+    for actor, target_actor in zip(target.actor.parameters(), target.actor_target.parameters()):
+        torch.testing.assert_close(actor, target_actor)
 
 
 def test_actor_only_transfer_keeps_fresh_critic_and_rejects_old_observation(tmp_path) -> None:
@@ -80,6 +169,7 @@ def test_state_agent_action_and_single_update() -> None:
         hidden_dim=32,
         batch_size=2,
         update_every_steps=1,
+        policy_delay=1,
     )
     agent = StateAgent(
         state_dim=47,
@@ -108,6 +198,15 @@ def test_state_agent_action_and_single_update() -> None:
 
     assert set(metrics) >= {"critic_loss", "actor_loss", "q", "target_q"}
     assert all(np.isfinite(value) for value in metrics.values())
+
+
+def test_value_estimate_uses_conservative_critic():
+    agent, _ = _training_fixture()
+    for parameter in agent.critic.parameters():
+        parameter.data.zero_()
+    agent.critic.q1[-1].bias.data.fill_(4)
+    agent.critic.q2[-1].bias.data.fill_(2)
+    assert agent.value({"state": np.zeros(3, dtype=np.float32)}) == 2.0
 
 
 def test_state_agent_action_validates_and_coerces_state() -> None:

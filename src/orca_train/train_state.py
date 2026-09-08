@@ -273,9 +273,11 @@ def _rotation_bucket(angle_rad: float) -> str | None:
     return None
 
 
-def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
+def evaluate_state(agent, env, episodes: int, seed: int, gamma: float = 0.99) -> dict:
     if episodes <= 0:
         raise ValueError("episodes must be positive")
+    if not np.isfinite(gamma) or not 0 <= gamma <= 1:
+        raise ValueError("gamma must be finite and within [0, 1]")
     initial_states = set()
     episode_lengths = []
     returns = []
@@ -288,6 +290,12 @@ def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
     best_errors = []
     funnel_metrics = []
     bucket_stats: dict[str, dict[str, object]] = {}
+    initial_values, discounted_returns, value_biases = [], [], []
+    action_squared_sum, saturated_actions, action_count = 0.0, 0, 0
+    control_metrics = {name: [] for name in (
+        "joint_target_limit_fraction", "joint_position_limit_fraction",
+        "controller_tracking_error_rms_deg",
+    )}
 
     def record_attempt(angle_rad: float | None) -> None:
         if angle_rad is None:
@@ -313,10 +321,21 @@ def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
         done = False
         info = reset_info
         episode_steps = 0
+        discounted_return = 0.0
+        initial_value = agent.value(observation) if hasattr(agent, "value") else None
+        if initial_value is not None:
+            initial_values.append(initial_value)
 
         while not done:
             action = agent.act(observation, step=0, eval_mode=True)
+            action_squared_sum += float(np.square(action).sum())
+            saturated_actions += int(np.sum(np.abs(action) > 0.95))
+            action_count += int(np.size(action))
             observation, reward, terminated, truncated, info = env.step(action)
+            discounted_return += gamma ** episode_steps * float(reward)
+            for name, values in control_metrics.items():
+                if name in info:
+                    values.append(float(info[name]))
             episode_steps += 1
             funnel.observe(info, episode_step=episode_steps)
             episode_return += float(reward)
@@ -349,6 +368,9 @@ def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
                     record_attempt(info.get("target_rotation_angle_rad"))
 
         returns.append(episode_return)
+        discounted_returns.append(discounted_return)
+        if terminated and initial_value is not None:
+            value_biases.append(initial_value - discounted_return)
         episode_lengths.append(episode_steps)
         successes.append(success)
         drops.append(dropped)
@@ -409,6 +431,14 @@ def evaluate_state(agent, env, episodes: int, seed: int) -> dict:
     }
 
     return {
+        "mean_initial_q": float(np.mean(initial_values)) if initial_values else None,
+        "mean_discounted_return": float(np.mean(discounted_returns)),
+        "mean_value_bias_terminal": float(np.mean(value_biases)) if value_biases else None,
+        "value_calibration_episodes": len(value_biases),
+        "action_rms": float(np.sqrt(action_squared_sum / action_count)),
+        "action_saturation_fraction": saturated_actions / action_count,
+        **{f"mean_{name}": float(np.mean(values)) if values else None
+           for name, values in control_metrics.items()},
         "episodes": episodes,
         "unique_initial_states": len(initial_states),
         "mean_episode_length": float(np.mean(episode_lengths)),
@@ -535,6 +565,7 @@ def train_state(
             zero_baseline = evaluate_state(
                 _ZeroActionAgent(action_dim), eval_env,
                 config.eval_episodes, config.eval_seed,
+                gamma=config.gamma,
             )
             event = {"type": "zero_action_evaluation", "step": start_step, **zero_baseline}
             write_metric(metrics_path, event)
@@ -606,7 +637,7 @@ def train_state(
 
             if config.eval_every_steps and step % config.eval_every_steps == 0:
                 result = evaluate_state(
-                    agent, eval_env, config.eval_episodes, config.eval_seed
+                    agent, eval_env, config.eval_episodes, config.eval_seed, gamma=config.gamma
                 )
                 event = {"type": "evaluation", "step": step, **result}
                 event["zero_action_success_rate"] = zero_baseline["success_rate"]

@@ -290,6 +290,31 @@ def test_state_evaluation_reports_orientation_and_rotation_bucket_metrics() -> N
     }
 
 
+@pytest.mark.parametrize("truncated", [False, True])
+def test_evaluation_calibrates_value_only_on_terminal_returns(truncated):
+    class KnownAgent:
+        def act(self, observation, step, eval_mode=False):
+            return np.tile([1.0, 0.0], 8)
+
+        def value(self, observation):
+            return 5.0
+
+    class KnownEnv(_EvaluationStateEnv):
+        def step(self, action):
+            obs, reward, terminal, _, info = super().step(action)
+            info["joint_target_limit_fraction"] = 0.25 if self.steps == 1 else 0.75
+            return obs, reward, terminal and not truncated, terminal and truncated, info
+
+    result = evaluate_state(KnownAgent(), KnownEnv(), episodes=1, seed=100, gamma=0.5)
+    assert result["mean_initial_q"] == 5.0
+    assert result["mean_discounted_return"] == 1.5
+    assert result["value_calibration_episodes"] == (0 if truncated else 1)
+    assert result["mean_value_bias_terminal"] == (None if truncated else 3.5)
+    assert result["action_rms"] == pytest.approx(np.sqrt(0.5))
+    assert result["action_saturation_fraction"] == 0.5
+    assert result["mean_joint_target_limit_fraction"] == 0.5
+
+
 class _TinyStateEnv:
     def __init__(self):
         self.action_space = spaces.Box(-1.0, 1.0, shape=(16,), dtype=np.float32)

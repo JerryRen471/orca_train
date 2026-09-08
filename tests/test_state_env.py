@@ -2,8 +2,21 @@ from types import SimpleNamespace
 
 import gymnasium as gym
 import numpy as np
+import pytest
 
 from orca_train.state_env import OrcaStateCubeEnv
+
+
+def test_control_diagnostics_exclude_fixed_wrist_and_measure_active_limits():
+    env = OrcaStateCubeEnv(env=_FakeStateCubeEnv(), fixed_joint_names=("right_wrist",))
+    env.reset()
+    env._target[:] = 0
+    env._target[:2] = 0.5
+    _, reward, _, _, info = env.step(np.zeros(16))
+    assert reward == 0.75
+    assert info["joint_target_limit_fraction"] == pytest.approx(1 / 16)
+    assert info["joint_position_limit_fraction"] == pytest.approx(1 / 16)
+    assert info["controller_tracking_error_rms_deg"] == 0
 
 
 class _FakeStateCubeEnv(gym.Env):
