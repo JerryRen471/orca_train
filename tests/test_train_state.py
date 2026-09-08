@@ -76,6 +76,13 @@ def test_state_training_rejects_invalid_behavior_noise_schedule() -> None:
         StateTrainConfig(behavior_stddev_schedule="linear(0.2,0.05,0)")
 
 
+def test_behavior_regularization_can_be_configured_and_disabled_from_cli():
+    assert parse_args(["--behavior-regularization-alpha", "0.2"]).behavior_regularization_alpha == 0.2
+    assert parse_args(["--no-behavior-regularization"]).behavior_regularization_alpha is None
+    with pytest.raises(ValueError, match="behavior_regularization_alpha"):
+        StateTrainConfig(behavior_regularization_alpha=-0.1)
+
+
 def test_state_curriculum_derives_distinct_default_run_directories() -> None:
     resolved = {
         preset: resolve_preset(StateTrainConfig(preset=preset, seed=7)).output_dir

@@ -9,6 +9,62 @@ from orca_train.replay import StateReplayBuffer
 from orca_train.state_agent import StateAgent, StateAgentConfig
 
 
+def test_behavior_regularizer_overcomes_extrapolated_q_outside_replay():
+    from orca_train.state_agent import regularized_actor_loss
+
+    action = torch.tensor([[0.9, 0.9]], requires_grad=True)
+    sampled_action = torch.zeros_like(action)
+    # The critic rewards an unsupported outward action; the policy must move back.
+    q = 100.0 * action.sum(dim=-1, keepdim=True)
+    loss, _ = regularized_actor_loss(q, action, sampled_action, alpha=0.1)
+    loss.backward()
+    assert torch.all(action.grad > 0)
+
+
+def test_behavior_regularizer_keeps_finite_q_gradient_near_zero():
+    from orca_train.state_agent import regularized_actor_loss
+
+    action = torch.zeros((1, 2), requires_grad=True)
+    q = action.sum(dim=-1, keepdim=True)
+    loss, _ = regularized_actor_loss(q, action, torch.zeros_like(action), alpha=0.1)
+    loss.backward()
+    torch.testing.assert_close(action.grad, torch.full((1, 2), -0.1))
+
+
+def test_disabled_behavior_regularizer_preserves_td3_objective():
+    from orca_train.state_agent import regularized_actor_loss
+
+    action = torch.tensor([[0.5, 0.5]], requires_grad=True)
+    q = action.sum(dim=-1, keepdim=True)
+    loss, _ = regularized_actor_loss(q, action, torch.zeros_like(action), alpha=None)
+    assert loss.item() == -1.0
+    loss.backward()
+    torch.testing.assert_close(action.grad, -torch.ones_like(action))
+
+
+def test_policy_update_moves_unsupported_saturated_actions_back_toward_replay():
+    agent, replay = _training_fixture()
+    agent.config = replace(agent.config, policy_delay=1, behavior_regularization_alpha=0.1)
+    for parameter in agent.actor.parameters():
+        parameter.data.zero_()
+    agent.actor.policy[-1].bias.data.fill_(np.arctanh(0.9))
+    for parameter in agent.critic.parameters():
+        parameter.data.zero_()
+    with torch.no_grad():
+        agent.critic.q1[0].weight[0, 3] = 1.0
+        agent.critic.q1[0].bias[0] = 2.0
+        agent.critic.q1[2].weight[0, 0] = 1.0
+        agent.critic.q1[4].weight[0, 0] = 100.0
+    for group in agent.critic_optimizer.param_groups:
+        group["lr"] = 0.0
+    observation = {"state": np.zeros(3, dtype=np.float32)}
+    before = agent.act(observation, 0, eval_mode=True)
+    metrics = agent.update(replay, step=1)
+    after = agent.act(observation, 0, eval_mode=True)
+    assert np.all(after < before)
+    assert metrics["actor_behavior_mse"] == pytest.approx(0.81)
+
+
 def _training_fixture():
     torch.manual_seed(31)
     agent = StateAgent(3, 2, "cpu", StateAgentConfig(

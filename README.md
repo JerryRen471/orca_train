@@ -26,10 +26,22 @@ exploration schedule. The actor optimizes deterministic Q1. Network width,
 learning rate, replay, n-step returns and the environment control period retain
 the state baseline settings.
 
-Checkpoints identify this algorithm as `state_td3_v1` and save both target
-networks and the critic-update counter. Full resume rejects checkpoints from the
-previous state algorithm; a dimension-compatible actor can still be transferred
-with `--warm-start`, which synchronizes its target actor and starts fresh critics.
+The default policy update also penalizes deviation from the actions sampled from
+replay. Its loss is `-alpha * mean(Q1) / max(mean(abs(Q1)), 1) + MSE(policy, replay)`;
+the Q denominator is detached from gradients. This TD3+BC-inspired constraint
+limits exploitation of actions with little replay support. The denominator floor
+avoids amplifying a nearly zero early critic. `--behavior-regularization-alpha`
+defaults to 0.1; `--no-behavior-regularization` recovers the unregularized TD3
+objective for comparisons. This online adaptation is evaluated separately from
+the original offline TD3+BC algorithm.
+
+Checkpoints identify the regularized algorithm as `state_td3_bc_v1` and save both
+target networks and the critic-update counter. Unregularized runs use
+`state_td3_v1`. Full resume requires the same algorithm and regularization alpha;
+a dimension-compatible actor can still be transferred with `--warm-start`, which
+synchronizes its target actor and starts fresh critics. Earlier 64-value state
+checkpoints support actor transfer but cannot restore their old critic/optimizers
+into the new algorithm.
 
 The state trainer uses a bounded 64-value observation in this order:
 

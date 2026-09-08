@@ -17,6 +17,18 @@ from .agent import (
 from .replay import StateReplayBuffer
 
 
+def regularized_actor_loss(
+    q: torch.Tensor, action: torch.Tensor, replay_action: torch.Tensor,
+    alpha: float | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    behavior_mse = F.mse_loss(action, replay_action)
+    if alpha is None:
+        return -q.mean(), behavior_mse
+    # Do not amplify a nearly zero, poorly calibrated early critic.
+    q_weight = alpha / q.detach().abs().mean().clamp(min=1.0)
+    return -q_weight * q.mean() + behavior_mse, behavior_mse
+
+
 @dataclass(frozen=True)
 class StateAgentConfig:
     hidden_dim: int = 1024
@@ -29,8 +41,12 @@ class StateAgentConfig:
     policy_delay: int = 2
     target_policy_noise: float = 0.2
     target_noise_clip: float = 0.5
+    behavior_regularization_alpha: float | None = 0.1
 
     def __post_init__(self) -> None:
+        alpha = self.behavior_regularization_alpha
+        if alpha is not None and (not np.isfinite(alpha) or alpha < 0):
+            raise ValueError("behavior_regularization_alpha must be finite and non-negative")
         for name in ("policy_delay", "update_every_steps"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -142,13 +158,17 @@ class StateAgent:
             try:
                 action = self.actor(batch.states)
                 actor_q1, _ = self.critic(batch.states, action)
-                actor_loss = -actor_q1.mean()
+                actor_loss, behavior_mse = regularized_actor_loss(
+                    actor_q1, action, batch.actions,
+                    self.config.behavior_regularization_alpha,
+                )
                 self.actor_optimizer.zero_grad(set_to_none=True)
                 actor_loss.backward()
                 self.actor_optimizer.step()
             finally:
                 self.critic.requires_grad_(True)
             metrics["actor_loss"] = float(actor_loss.item())
+            metrics["actor_behavior_mse"] = float(behavior_mse.item())
             with torch.no_grad():
                 for online, target in (
                     (self.actor, self.actor_target),
@@ -161,7 +181,7 @@ class StateAgent:
     def save(self, path: str | Path, step: int) -> None:
         torch.save(
             {
-                "algorithm": "state_td3_v1",
+                "algorithm": self._algorithm_name(),
                 "observation_mode": "state",
                 "state_dim": self.state_dim,
                 "action_dim": self.action_dim,
@@ -210,11 +230,16 @@ class StateAgent:
 
     def load(self, path: str | Path) -> int:
         state = self._load_checkpoint(path)
-        if state.get("algorithm") != "state_td3_v1":
+        if state.get("algorithm") != self._algorithm_name():
             raise ValueError("Incompatible checkpoint algorithm; use actor-only warm_start")
+        if state["config"].get("behavior_regularization_alpha") != self.config.behavior_regularization_alpha:
+            raise ValueError("Incompatible checkpoint behavior_regularization_alpha; use actor-only warm_start")
         for name in ("actor", "actor_target", "critic", "critic_target"):
             getattr(self, name).load_state_dict(state[name])
         self.critic_updates = int(state["critic_updates"])
         for name in ("actor_optimizer", "critic_optimizer"):
             getattr(self, name).load_state_dict(state[name])
         return int(state["step"])
+
+    def _algorithm_name(self) -> str:
+        return "state_td3_v1" if self.config.behavior_regularization_alpha is None else "state_td3_bc_v1"

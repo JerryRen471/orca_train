@@ -27,6 +27,7 @@ class StateTrainConfig:
     seed_action_scale: float = 0.1
     behavior_stddev_schedule: str = "linear(0.2,0.05,100000)"
     behavior_stddev_clip: float = 0.2
+    behavior_regularization_alpha: float | None = 0.1
     eval_every_steps: int = 10_000
     eval_episodes: int = 100
     eval_seed: int = 10_000
@@ -71,6 +72,9 @@ class StateTrainConfig:
     reward_mode: str | None = None
 
     def __post_init__(self) -> None:
+        alpha = self.behavior_regularization_alpha
+        if alpha is not None and (not np.isfinite(alpha) or alpha < 0):
+            raise ValueError("behavior_regularization_alpha must be finite and non-negative")
         if self.resume is not None and self.warm_start is not None:
             raise ValueError("resume and warm_start are mutually exclusive")
         for name in ("stable_hold_reward_scale", "reset_settle_duration_s", "cube_pos_xy_jitter"):
@@ -543,6 +547,7 @@ def train_state(
                 batch_size=config.batch_size,
                 stddev_schedule=config.behavior_stddev_schedule,
                 stddev_clip=config.behavior_stddev_clip,
+                behavior_regularization_alpha=config.behavior_regularization_alpha,
             ),
         )
         replay = StateReplayBuffer(
@@ -682,6 +687,12 @@ def parse_args(argv: list[str] | None = None) -> StateTrainConfig:
         default="linear(0.2,0.05,100000)",
     )
     parser.add_argument("--behavior-stddev-clip", type=float, default=0.2)
+    regularization = parser.add_mutually_exclusive_group()
+    regularization.add_argument("--behavior-regularization-alpha", type=float, default=0.1)
+    regularization.add_argument(
+        "--no-behavior-regularization", dest="behavior_regularization_alpha",
+        action="store_const", const=None,
+    )
     parser.add_argument("--eval-every-steps", type=int, default=10_000)
     parser.add_argument("--eval-episodes", type=int, default=100)
     parser.add_argument("--eval-seed", type=int, default=10_000)
