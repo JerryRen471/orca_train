@@ -43,12 +43,14 @@ Run Python through `uv` in the configured project environment. `TEACHER` is an e
 ```bash
 uv run python -m orca_train.pixel_distill collect \
   --teacher "$TEACHER" --episodes 96 --seed 300000 \
+  --camera-look-at 0.177 -0.015 0.175 \
   --domain-config configs/domain_randomization/transfer_v1.json --output runs/dr_data
 uv run python -m orca_train.pixel_distill fit \
   --data "$NOMINAL_DATA" runs/dr_data --resume "$BASELINE" \
   --seed 1 --steps 3000 --learning-rate 0.0001 --device mps --output runs/dr_student
 uv run python -m orca_train.pixel_distill evaluate \
   --teacher "$TEACHER" --student runs/dr_student/checkpoint_3000.pt \
+  --camera-look-at 0.177 -0.015 0.175 \
   --episodes 50 --seed 330000 --domain-config configs/domain_randomization/transfer_v1.json \
   --output runs/dr_evaluation.json
 ```
