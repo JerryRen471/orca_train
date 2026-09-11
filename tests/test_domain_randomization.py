@@ -4,7 +4,7 @@ import mujoco
 import numpy as np
 import pytest
 
-from orca_train.domain_randomization import DomainConfig, EpisodeDomain
+from orca_train.domain_randomization import DomainConfig, EpisodeDomain, configure_fixed_camera
 
 
 def model():
@@ -61,6 +61,24 @@ def test_visual_changes_do_not_change_physics_draws_and_zero_ranges_are_identity
 def test_invalid_domains_are_rejected(values):
     with pytest.raises(ValueError):
         DomainConfig(**values)
+
+
+def test_fixed_camera_does_not_follow_cube_after_domain_reset():
+    m = model()
+    camera = m.camera('closeup').id
+    m.cam_mode[camera] = mujoco.mjtCamLight.mjCAMLIGHT_TARGETBODY
+    m.cam_targetbodyid[camera] = m.body('task_cube').id
+    d = mujoco.MjData(m)
+    configure_fixed_camera(m, 'closeup', [.01, .02, 0.])
+    domain = EpisodeDomain(m, DomainConfig())
+    domain.reset(41, d)
+    mujoco.mj_forward(m, d)
+    position, orientation = d.cam_xpos.copy(), d.cam_xmat.copy()
+    d.qpos[:3] += [.1, .05, -.03]
+    mujoco.mj_forward(m, d)
+    np.testing.assert_array_equal(d.cam_xpos, position)
+    np.testing.assert_array_equal(d.cam_xmat, orientation)
+    assert m.cam_targetbodyid[camera] == -1
 
 
 def test_visual_randomization_preserves_task_reset_rng_and_action_dynamics():

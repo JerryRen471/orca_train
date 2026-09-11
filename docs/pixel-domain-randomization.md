@@ -4,6 +4,15 @@
 enables episode-level simulation and sensor randomization. Omitting the flag preserves nominal behavior.
 Students still consume only three 84 x 84 RGB frames; the teacher sees state only when generating action labels.
 
+The existing scene camera automatically points at the cube (`targetbody` mode).
+For a fixed physical camera, pass `--camera-look-at 0.177 -0.015 0.175` to collection
+and evaluation. This sets the orientation once using a constant world-space
+reference, disables target tracking, and leaves orientation fixed when the cube
+moves. The reference is a provisional mount setup, not a real-camera calibration.
+Position randomization translates this fixed camera without retargeting it.
+The selected camera setup is recorded separately from the domain profile in data
+manifests and evaluation reports; neither setup is provided to the student as input.
+
 ## Provisional ranges
 
 | Quantity | Distribution |

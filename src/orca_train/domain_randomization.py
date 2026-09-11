@@ -7,6 +7,29 @@ from pathlib import Path
 import numpy as np
 
 
+def configure_fixed_camera(model, camera_name, look_at):
+    """Set a world-mounted camera once, without following the simulated object."""
+    import mujoco
+
+    camera = model.camera(camera_name).id
+    target = np.asarray(look_at, dtype=np.float64)
+    if target.shape != (3,) or not np.all(np.isfinite(target)):
+        raise ValueError("Camera look-at must contain three finite world coordinates")
+    if model.cam_bodyid[camera] != 0:
+        raise ValueError("Fixed camera configuration requires a world-mounted camera")
+    z = model.cam_pos[camera] - target
+    if np.linalg.norm(z) < 1e-8:
+        raise ValueError("Camera position and look-at must differ")
+    z /= np.linalg.norm(z)
+    up = np.array([0., 1., 0.]) if abs(z[2]) > .99 else np.array([0., 0., 1.])
+    x = np.cross(up, z)
+    x /= np.linalg.norm(x)
+    y = np.cross(z, x)
+    mujoco.mju_mat2Quat(model.cam_quat[camera], np.column_stack([x, y, z]).ravel())
+    model.cam_mode[camera] = mujoco.mjtCamLight.mjCAMLIGHT_FIXED
+    model.cam_targetbodyid[camera] = -1
+
+
 @dataclass(frozen=True)
 class DomainConfig:
     """Provisional symmetric ranges around the calibrated simulation, per episode."""

@@ -14,7 +14,7 @@ import torch
 from torch.nn import functional as F
 
 from .agent import RandomShiftsAug
-from .domain_randomization import DomainConfig, EpisodeDomain
+from .domain_randomization import DomainConfig, EpisodeDomain, configure_fixed_camera
 from .guarded_state_policy import GuardedStatePolicy
 from .pixel_student import PixelStudent, PixelStudentConfig
 from .state_agent import StateAgent, StateAgentConfig
@@ -63,12 +63,14 @@ def load_teacher(directory):
 class PixelView:
     """Render the teacher task without changing its resets or accumulated-target actions."""
 
-    def __init__(self, env, config: PixelStudentConfig, renderer=None, domain=None):
+    def __init__(self, env, config: PixelStudentConfig, renderer=None, domain=None, camera_look_at=None):
         self.env, self.config = env, config
         self.frames = deque(maxlen=config.frame_stack)
         self.teacher_observation = None
         if renderer is None:
             env.env.model.cam_fovy[env.env.model.camera(config.camera_name).id] = config.camera_fovy
+        if camera_look_at is not None:
+            configure_fixed_camera(env.env.model, config.camera_name, camera_look_at)
         self.domain = EpisodeDomain(env.env.model, domain, config.camera_name) if domain else None
         if renderer is None:
             import mujoco
@@ -106,11 +108,11 @@ class PixelView:
 
 
 @contextmanager
-def make_pixel_env(task_config, student_config, domain=None):
+def make_pixel_env(task_config, student_config, domain=None, camera_look_at=None):
     env = make_state_env(task_config)
     view = None
     try:
-        view = PixelView(env, student_config, domain=domain)
+        view = PixelView(env, student_config, domain=domain, camera_look_at=camera_look_at)
         yield view
     finally:
         if view is not None:
@@ -139,6 +141,7 @@ class Demonstrations:
                 raise ValueError("Dataset visual configuration does not match student")
             self.manifests.append({"path": str((directory / "manifest.json").resolve()),
                                    "sha256": sha256(directory / "manifest.json"),
+                                   "camera_look_at": manifest.get("camera_look_at"),
                                    "domain_randomization": manifest.get("domain_randomization")})
             for episode in manifest["episodes"]:
                 if episode["seed"] in seen_seeds:
@@ -208,7 +211,8 @@ def collect(args):
     rng = np.random.default_rng(args.seed)
     episodes = []
     domain = DomainConfig.load(getattr(args, "domain_config", None))
-    with make_pixel_env(task_config, config, domain) as env:
+    camera_look_at = getattr(args, "camera_look_at", None)
+    with make_pixel_env(task_config, config, domain, camera_look_at) as env:
         for offset in range(args.episodes):
             seed = args.seed + offset
             observation, _ = env.reset(seed)
@@ -242,6 +246,7 @@ def collect(args):
                 "teacher_probability": args.beta, "action_noise_std": args.noise,
                 "student_inputs": ["pixels"], "label": "teacher action at the exact pre-action state",
                 "domain_randomization": asdict(domain) if domain else None,
+                "camera_look_at": camera_look_at,
                 "episodes": episodes, "summary": summarize(episodes)}
     write_json(args.output / "manifest.json", manifest)
     print(json.dumps({"type": "collection_complete", **manifest["summary"]}), flush=True)
@@ -314,7 +319,8 @@ def evaluate(args):
             raise ValueError("Evaluation seeds overlap demonstration collection")
     episodes = []
     domain = DomainConfig.load(getattr(args, "domain_config", None))
-    with make_pixel_env(task_config, config, domain) as env:
+    camera_look_at = getattr(args, "camera_look_at", None)
+    with make_pixel_env(task_config, config, domain, camera_look_at) as env:
         for offset in range(args.episodes):
             seed = args.seed + offset
             observation, initial = env.reset(seed)
@@ -346,6 +352,7 @@ def evaluate(args):
               "student_config": asdict(config), "seed_start": args.seed,
               "student_inputs": ["pixels"] if not args.teacher_policy else ["state"],
               "domain_randomization": asdict(domain) if domain else None,
+              "camera_look_at": camera_look_at,
               "summary": summarize(episodes), "episodes": episodes}
     write_json(args.output, report)
     print(json.dumps({"type": "evaluation_complete", **report["summary"]}), flush=True)
@@ -362,6 +369,8 @@ def main():
         child.add_argument("--seed", type=int, required=True)
         child.add_argument("--output", type=Path, required=True)
         child.add_argument("--domain-config", type=Path, help="JSON DomainConfig; omitted means nominal environment")
+        child.add_argument("--camera-look-at", nargs=3, type=float,
+                           help="Fixed world camera aimed once at X Y Z; never follows the cube")
         if name == "collect":
             child.add_argument("--beta", type=float, default=1.0)
             child.add_argument("--noise", type=float, default=0.0)
