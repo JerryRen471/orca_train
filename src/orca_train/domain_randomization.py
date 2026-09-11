@@ -32,7 +32,7 @@ def configure_fixed_camera(model, camera_name, look_at):
 
 @dataclass(frozen=True)
 class DomainConfig:
-    """Provisional symmetric ranges around the calibrated simulation, per episode."""
+    """Provisional symmetric ranges around the nominal simulation, per episode."""
 
     mass_fraction: float = 0.10
     friction_fraction: float = 0.10
