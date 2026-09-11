@@ -25,7 +25,10 @@ def sha256(path):
 
 
 def write_json(path, value):
-    Path(path).write_text(json.dumps(value, indent=2) + "\n")
+    path = Path(path)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
+    temporary.replace(path)
 
 
 def read_task_config(directory):
