@@ -136,6 +136,22 @@ def test_dataset_checks_integrity(tmp_path):
         Demonstrations([path], small_config())
 
 
+def test_fine_tuning_retains_parent_training_seeds(tmp_path):
+    from orca_train.pixel_distill import fit
+
+    directory = tmp_path / 'data'
+    make_dataset(directory, seed=1)
+    parent = tmp_path / 'parent.pt'
+    PixelStudent(small_config()).save(parent, metadata={
+        'teacher': {'checkpoint_sha256': 'abc'}, 'training_reset_seeds': [99]})
+    fit(SimpleNamespace(seed=2, resume=parent, device='cpu', data=[directory],
+                        learning_rate=.0001, augmentation_pad=0, output=tmp_path / 'fit',
+                        batch_size=2, steps=1, checkpoint_every=1))
+    _, metadata = PixelStudent.load(tmp_path / 'fit/checkpoint_1.pt')
+    assert metadata['training_reset_seeds'] == [1, 99]
+    assert metadata['parent_sha256'] == sha256(parent)
+
+
 @pytest.mark.parametrize("wrong_task", [False, True])
 def test_evaluation_rejects_training_seeds_or_different_task(tmp_path, monkeypatch, wrong_task):
     import orca_train.pixel_distill as module

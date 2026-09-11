@@ -1,0 +1,14 @@
+{
+  "mass_fraction": 0.1,
+  "friction_fraction": 0.1,
+  "gain_fraction": 0.05,
+  "damping_fraction": 0.1,
+  "camera_position_m": 0.008,
+  "camera_fovy_deg": 2.0,
+  "light_fraction": 0.25,
+  "material_fraction": 0.15,
+  "exposure_fraction": 0.15,
+  "white_balance_fraction": 0.08,
+  "noise_std_max": 1.5,
+  "blur_mix_max": 0.2
+}

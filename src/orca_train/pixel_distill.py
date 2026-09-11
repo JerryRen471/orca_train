@@ -14,6 +14,7 @@ import torch
 from torch.nn import functional as F
 
 from .agent import RandomShiftsAug
+from .domain_randomization import DomainConfig, EpisodeDomain
 from .guarded_state_policy import GuardedStatePolicy
 from .pixel_student import PixelStudent, PixelStudentConfig
 from .state_agent import StateAgent, StateAgentConfig
@@ -62,13 +63,15 @@ def load_teacher(directory):
 class PixelView:
     """Render the teacher task without changing its resets or accumulated-target actions."""
 
-    def __init__(self, env, config: PixelStudentConfig, renderer=None):
+    def __init__(self, env, config: PixelStudentConfig, renderer=None, domain=None):
         self.env, self.config = env, config
         self.frames = deque(maxlen=config.frame_stack)
         self.teacher_observation = None
         if renderer is None:
-            import mujoco
             env.env.model.cam_fovy[env.env.model.camera(config.camera_name).id] = config.camera_fovy
+        self.domain = EpisodeDomain(env.env.model, domain, config.camera_name) if domain else None
+        if renderer is None:
+            import mujoco
             renderer = mujoco.Renderer(env.env.model, height=config.image_size, width=config.image_size)
         self.renderer = renderer
 
@@ -77,12 +80,16 @@ class PixelView:
         frame = np.asarray(self.renderer.render(), dtype=np.uint8)
         if frame.shape != (self.config.image_size, self.config.image_size, 3):
             raise ValueError("Renderer returned an unexpected image shape")
+        if self.domain:
+            frame = self.domain.image(frame)
         return np.ascontiguousarray(frame.transpose(2, 0, 1))
 
     def observation(self):
         return {"pixels": np.concatenate(tuple(self.frames), axis=0)}
 
     def reset(self, seed):
+        if self.domain:
+            self.domain.reset(seed, self.env.env.data)
         self.teacher_observation, info = self.env.reset(seed=seed)
         frame = self._frame()
         self.frames.clear()
@@ -99,11 +106,11 @@ class PixelView:
 
 
 @contextmanager
-def make_pixel_env(task_config, student_config):
+def make_pixel_env(task_config, student_config, domain=None):
     env = make_state_env(task_config)
     view = None
     try:
-        view = PixelView(env, student_config)
+        view = PixelView(env, student_config, domain=domain)
         yield view
     finally:
         if view is not None:
@@ -131,7 +138,8 @@ class Demonstrations:
             if manifest["student_config"] != asdict(config):
                 raise ValueError("Dataset visual configuration does not match student")
             self.manifests.append({"path": str((directory / "manifest.json").resolve()),
-                                   "sha256": sha256(directory / "manifest.json")})
+                                   "sha256": sha256(directory / "manifest.json"),
+                                   "domain_randomization": manifest.get("domain_randomization")})
             for episode in manifest["episodes"]:
                 if episode["seed"] in seen_seeds:
                     raise ValueError("Duplicate reset seed in training data")
@@ -199,7 +207,8 @@ def collect(args):
     args.output.mkdir(parents=True, exist_ok=False)
     rng = np.random.default_rng(args.seed)
     episodes = []
-    with make_pixel_env(task_config, config) as env:
+    domain = DomainConfig.load(getattr(args, "domain_config", None))
+    with make_pixel_env(task_config, config, domain) as env:
         for offset in range(args.episodes):
             seed = args.seed + offset
             observation, _ = env.reset(seed)
@@ -223,6 +232,8 @@ def collect(args):
                                 executed_actions=np.stack(executed))
             result = episode_summary(seed, infos, rewards, executed, task_config.control_period_s)
             result.update(file=path.name, sha256=sha256(path))
+            if env.domain:
+                result["domain"] = env.domain.parameters
             episodes.append(result)
             print(json.dumps({"type": "collection", "index": offset + 1, **result}), flush=True)
     manifest = {"format": "orca-pixel-demonstrations-v1", "teacher": provenance,
@@ -230,6 +241,7 @@ def collect(args):
                 "student_sha256": sha256(args.student) if args.student else None,
                 "teacher_probability": args.beta, "action_noise_std": args.noise,
                 "student_inputs": ["pixels"], "label": "teacher action at the exact pre-action state",
+                "domain_randomization": asdict(domain) if domain else None,
                 "episodes": episodes, "summary": summarize(episodes)}
     write_json(args.output / "manifest.json", manifest)
     print(json.dumps({"type": "collection_complete", **manifest["summary"]}), flush=True)
@@ -254,9 +266,9 @@ def fit(args):
                 "data": data.manifests, "parent_sha256": sha256(args.resume) if args.resume else None,
                 "parent": parent, "optimizer": "fresh Adam", "loss": "mean squared teacher action error"}
     metadata["teacher"] = data.teacher
-    metadata["training_reset_seeds"] = sorted(data.seeds)
+    metadata["training_reset_seeds"] = sorted(data.seeds | set(parent.get("training_reset_seeds", []) if parent else []))
     metadata["source_sha256"] = {name: sha256(Path(__file__).with_name(name))
-                                  for name in ["pixel_distill.py", "pixel_student.py", "agent.py"]}
+                                  for name in ["pixel_distill.py", "pixel_student.py", "agent.py", "domain_randomization.py"]}
     write_json(args.output / "training.json", metadata)
     started = time.monotonic()
     losses = []
@@ -301,7 +313,8 @@ def evaluate(args):
         if set(range(args.seed, args.seed + args.episodes)).intersection(metadata["training_reset_seeds"]):
             raise ValueError("Evaluation seeds overlap demonstration collection")
     episodes = []
-    with make_pixel_env(task_config, config) as env:
+    domain = DomainConfig.load(getattr(args, "domain_config", None))
+    with make_pixel_env(task_config, config, domain) as env:
         for offset in range(args.episodes):
             seed = args.seed + offset
             observation, initial = env.reset(seed)
@@ -319,6 +332,8 @@ def evaluate(args):
                     break
             result = episode_summary(seed, infos, rewards, actions, task_config.control_period_s)
             result["initial_cube_pos"] = np.asarray(initial["cube_pos"]).tolist()
+            if env.domain:
+                result["domain"] = env.domain.parameters
             if offset < 3:
                 result["trajectory"] = trajectory
             episodes.append(result)
@@ -330,6 +345,7 @@ def evaluate(args):
               "task_config_sha256": sha256(args.teacher / "config.json"),
               "student_config": asdict(config), "seed_start": args.seed,
               "student_inputs": ["pixels"] if not args.teacher_policy else ["state"],
+              "domain_randomization": asdict(domain) if domain else None,
               "summary": summarize(episodes), "episodes": episodes}
     write_json(args.output, report)
     print(json.dumps({"type": "evaluation_complete", **report["summary"]}), flush=True)
@@ -345,6 +361,7 @@ def main():
         child.add_argument("--episodes", type=int, default=64)
         child.add_argument("--seed", type=int, required=True)
         child.add_argument("--output", type=Path, required=True)
+        child.add_argument("--domain-config", type=Path, help="JSON DomainConfig; omitted means nominal environment")
         if name == "collect":
             child.add_argument("--beta", type=float, default=1.0)
             child.add_argument("--noise", type=float, default=0.0)
